@@ -1,0 +1,210 @@
+use std::{
+    ffi::c_void,
+    fmt,
+    future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
+
+use futures_util::FutureExt;
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::{runtime::Handle, task::AbortHandle};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    Builder, Result, borrow_slice, check, discard_panic, panic_message, release_context, slice, sys,
+};
+
+/// A request name, its typed payload, and the value returned by its handler.
+pub trait Request: Serialize + DeserializeOwned + Send + 'static {
+    const NAME: &'static str;
+    type Answer: Serialize + DeserializeOwned + Send + 'static;
+}
+
+/// A delivered request passed to its host handler.
+#[derive(Debug)]
+pub struct Asked<R> {
+    pub payload: R,
+    /// The requesting process's path in the volume.
+    pub process: Vec<u8>,
+    /// The Siphon-generated mailbox key.
+    pub key: String,
+    /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
+    pub cancelled: CancellationToken,
+}
+
+/// The answer as read from a requesting process's mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer<A> {
+    Given(A),
+    Failed(String),
+    Interrupted,
+}
+
+/// Why a host handler returned without a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unanswered {
+    Failed(String),
+    Interrupted,
+}
+
+impl fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(reason) => f.write_str(reason),
+            Self::Interrupted => f.write_str("interrupted"),
+        }
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
+impl Builder {
+    /// Registers a request handler on a host Tokio executor.
+    ///
+    /// The executor must run while requests are handled. Delivery can begin during
+    /// [`Builder::open`], before the caller receives the Siphon runtime. A process stop signals
+    /// [`Asked::cancelled`] so the handler can cooperate. Closing a delivery asks the executor to
+    /// abort its task and lets Siphon shut down without waiting for the host.
+    pub fn handle<R, F, A>(&mut self, executor: &Handle, handler: F) -> Result<&mut Self>
+    where
+        R: Request,
+        F: Fn(Asked<R>) -> A + Send + Sync + 'static,
+        A: Future<Output = std::result::Result<R::Answer, Unanswered>> + Send + 'static,
+    {
+        let context = Box::into_raw(Box::new(Registration {
+            executor: executor.clone(),
+            handler: Arc::new(handler),
+        }))
+        .cast();
+        // SAFETY: the builder is exclusively borrowed and the name is static. Native takes
+        // ownership of the boxed context on all paths and keeps it live while delivering.
+        check(unsafe {
+            sys::siphon_builder_handle_request(
+                self.0.as_ptr(),
+                slice(R::NAME.as_bytes()),
+                context,
+                Some(deliver::<R, F, A>),
+                Some(release_context::<Registration<F>>),
+            )
+        })?;
+        Ok(self)
+    }
+}
+
+struct Registration<F> {
+    executor: Handle,
+    handler: Arc<F>,
+}
+
+struct Delivery {
+    cancelled: CancellationToken,
+    task: AbortHandle,
+}
+
+struct Reply(*mut sys::Reply);
+
+// SAFETY: the unique native reply handle can be submitted and freed on a host thread.
+unsafe impl Send for Reply {}
+
+impl Reply {
+    fn submit(self, answer: std::result::Result<Vec<u8>, Unanswered>) {
+        let (kind, payload) = match &answer {
+            Ok(data) => (sys::ANSWER_GIVEN, data.as_slice()),
+            Err(Unanswered::Failed(reason)) => (sys::ANSWER_FAILED, reason.as_bytes()),
+            Err(Unanswered::Interrupted) => (sys::ANSWER_INTERRUPTED, &[][..]),
+        };
+        // SAFETY: the handle is owned here and payload is readable for this call. A closed
+        // delivery can reject the answer. The native waiter decides whether to commit it.
+        let _ = check(unsafe { sys::siphon_reply_submit(self.0, kind, slice(payload)) });
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        // SAFETY: this handle was transferred by native and is freed here once.
+        unsafe { sys::siphon_reply_free(self.0) };
+    }
+}
+
+unsafe extern "C" fn deliver<R, F, A>(
+    context: *mut c_void,
+    process: sys::Slice,
+    key: sys::Slice,
+    payload: sys::Slice,
+    reply: *mut sys::Reply,
+) -> sys::Watch
+where
+    R: Request,
+    F: Fn(Asked<R>) -> A + Send + Sync + 'static,
+    A: Future<Output = std::result::Result<R::Answer, Unanswered>> + Send + 'static,
+{
+    let reply = Reply(reply);
+    let started = catch_unwind(AssertUnwindSafe(move || {
+        // SAFETY: native keeps its registration and slices live throughout the callback.
+        let registration = unsafe { &*context.cast::<Registration<F>>() };
+        let (process, key, payload) = unsafe {
+            (
+                borrow_slice(process).to_vec(),
+                borrow_slice(key).to_vec(),
+                borrow_slice(payload).to_vec(),
+            )
+        };
+        let cancelled = CancellationToken::new();
+        let signal = cancelled.clone();
+        let handler = Arc::clone(&registration.handler);
+        let task = registration.executor.spawn(async move {
+            let answer = AssertUnwindSafe(async move {
+                let payload = serde_json::from_slice(&payload).map_err(|error| {
+                    Unanswered::Failed(format!("the request could not be read: {error}"))
+                })?;
+                let key = String::from_utf8(key).map_err(|error| {
+                    Unanswered::Failed(format!("the request key could not be read: {error}"))
+                })?;
+                let given = handler(Asked {
+                    payload,
+                    process,
+                    key,
+                    cancelled: signal,
+                })
+                .await?;
+                serde_json::to_vec(&given).map_err(|error| {
+                    Unanswered::Failed(format!("the answer could not be written: {error}"))
+                })
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                let reason = format!("the handler panicked: {}", panic_message(panic.as_ref()));
+                discard_panic(panic);
+                Err(Unanswered::Failed(reason))
+            });
+            reply.submit(answer);
+        });
+        let delivery = Delivery {
+            cancelled,
+            task: task.abort_handle(),
+        };
+        sys::Watch {
+            context: Box::into_raw(Box::new(delivery)).cast(),
+            notify: Some(notify),
+            release: Some(release_context::<Delivery>),
+        }
+    }));
+    started.unwrap_or_else(|panic| {
+        discard_panic(panic);
+        sys::Watch::default()
+    })
+}
+
+unsafe extern "C" fn notify(context: *mut c_void, event: u32) {
+    // SAFETY: native keeps the delivery context live until its notifications finish.
+    let delivery = unsafe { &*context.cast::<Delivery>() };
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| match event {
+        sys::REQUEST_STOP => delivery.cancelled.cancel(),
+        sys::REQUEST_CLOSED => delivery.task.abort(),
+        _ => {}
+    })) {
+        discard_panic(panic);
+    }
+}

@@ -1,12 +1,22 @@
 //! Safe Rust interface to a separately built Siphon binary.
 //! Register programs on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
+//! Register handlers on a host executor to answer typed [`Request`]s from programs.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
 mod program;
+mod request;
 mod sys;
 
-use std::{path::Path, ptr::NonNull};
+use std::{
+    any::Any,
+    ffi::c_void,
+    mem::forget,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
+    ptr::NonNull,
+};
 
 pub use program::{Builder, Ending, Options, Outcome, Program, Retries, Run, Wait};
+pub use request::{Answer, Asked, Request, Unanswered};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -35,6 +45,39 @@ fn slice(bytes: &[u8]) -> sys::Slice {
         len: bytes.len(),
     }
 }
+
+/// Safety: the slice must remain readable for the returned borrow.
+unsafe fn borrow_slice<'a>(value: sys::Slice) -> &'a [u8] {
+    if value.len == 0 {
+        return &[];
+    }
+    // SAFETY: the caller guarantees the bytes are readable for this borrow.
+    unsafe { std::slice::from_raw_parts(value.data, value.len) }
+}
+
+unsafe extern "C" fn release_context<T>(context: *mut c_void) {
+    // SAFETY: release is called once for this boxed context, after its final use.
+    let context = unsafe { Box::from_raw(context.cast::<T>()) };
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(context))) {
+        discard_panic(panic);
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+fn discard_panic(panic: Box<dyn Any + Send>) {
+    // A custom panic payload can itself panic on drop. Never let that unwind into C.
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(panic))) {
+        forget(panic);
+    }
+}
+
 fn take(buffer: sys::Buffer) -> Vec<u8> {
     // SAFETY: only library-owned result buffers reach this function; bytes are copied before release.
     unsafe {
@@ -60,7 +103,7 @@ fn check(status: sys::Status) -> Result<()> {
 }
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
-    if unsafe { sys::siphon_abi_version() } == 2 {
+    if unsafe { sys::siphon_abi_version() } == 3 {
         Ok(())
     } else {
         Err(Error {

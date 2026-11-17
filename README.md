@@ -5,8 +5,8 @@ Public Rust interface and binary distribution for Siphon.
 ## Status
 
 Development preview. The current slice implements atomic storage changes, retained snapshots, program
-execution, shutdown and persistent reopening. Host request handlers, streaming, machine operations
-and processing libraries are still being adapted.
+execution, asynchronous host request handlers, shutdown and persistent reopening. Streaming, machine
+operations and processing libraries are still being adapted.
 
 The Cargo package is `octoii-siphon-lib`, imported as `octoii_siphon_lib`. It links a separately built
 static library through the C ABI in `include/siphon.h`. No private source dependency, bindgen, or
@@ -17,7 +17,7 @@ consumer-side C compiler is needed. No Rust ABI, runtime object or allocator own
 Set `SIPHON_LIB_DIR` to a prebuilt artifact directory containing `libsiphon_native.a` and `manifest.json`:
 
 ```json
-{"abi": 2, "target": "aarch64-apple-darwin", "sha256": "<SHA-256 of the archive>"}
+{"abi": 3, "target": "aarch64-apple-darwin", "sha256": "<SHA-256 of the archive>"}
 ```
 
 ```sh
@@ -85,6 +85,77 @@ Initialize the program before registering it. A persisted process can resume dur
 before the caller receives the runtime. Blocking runtime calls return status 6 from phase callbacks
 and program destructors. Dropping the last runtime owner there starts shutdown, which finishes once
 the callback returns.
+
+## Handling a request
+
+Register each request type on the builder with a handle to the host's Tokio executor. The handler
+receives the typed payload, the requesting process path, its mailbox key, and a cancellation token.
+Keep the executor running for as long as it handles requests. A process can resume and deliver a
+request before `Builder::open` returns.
+
+```rust,no_run
+use octoii_siphon_lib::{
+    Answer, Asked, Builder, Ending, Program, Request, Result, Run, Runtime, Wait,
+};
+use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
+
+#[derive(Deserialize, Serialize)]
+struct Measure(String);
+
+impl Request for Measure {
+    const NAME: &'static str = "example.measure";
+    type Answer = usize;
+}
+
+struct MeasureMessage;
+
+impl Program for MeasureMessage {
+    const KIND: &'static str = "example.measure-message";
+    type Input = String;
+    type Checkpoint = String;
+    type Output = usize;
+
+    fn run(
+        &self,
+        run: &mut Run<'_>,
+        text: String,
+        checkpoint: Option<String>,
+    ) -> Result<Ending<String, usize>> {
+        let Some(key) = checkpoint else {
+            let key = run.request(&Measure(text))?;
+            return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
+        };
+        let Some(answer) = run.answer::<Measure>(&key)? else {
+            return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
+        };
+        run.take_mail(&key)?;
+        Ok(match answer {
+            Answer::Given(length) => Ending::Done(length),
+            Answer::Failed(reason) => Ending::Fail(reason),
+            Answer::Interrupted => Ending::Fail("measurement interrupted".into()),
+        })
+    }
+}
+
+fn open(executor: &Handle) -> Result<Runtime> {
+    let mut builder = Builder::new()?;
+    builder.program(MeasureMessage)?;
+    builder.handle(executor, |asked: Asked<Measure>| async move {
+        Ok(asked.payload.0.len())
+    })?;
+    builder.memory()
+}
+```
+
+The request and its mailbox wait commit with the phase. Reading an answer uses the phase's snapshot,
+and removing mail stages a change in the same batch as the phase's writes and ending.
+
+A stop signals `asked.cancelled`. The handler can return a partial result or
+`Unanswered::Interrupted`. Closing the runtime asks the host executor to abort pending handler
+tasks and returns without waiting for them. When persistent storage reopens with the same request
+name registered, pending requests are answered with `Interrupted` without another handler call.
+Panics while constructing or polling the handler become failed answers.
 
 The private implementation lives in `devxiyang/octoii-siphon`. This repository contains only the public
 wrapper, interface declarations, consumer tests and distribution metadata. The wrapper source is MIT;

@@ -1,7 +1,6 @@
 use std::{
-    any::Any,
     ffi::c_void,
-    mem::{ManuallyDrop, forget},
+    mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr::NonNull,
@@ -11,12 +10,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
 use crate::{
-    ChangeHandle, Error, Result, Runtime, SnapshotHandle, check, compatible, handle, slice, sys,
+    Answer, ChangeHandle, Error, Request, Result, Runtime, SnapshotHandle, borrow_slice, check,
+    compatible, discard_panic, handle, panic_message, present, release_context, slice, sys, take,
 };
 
-/// Programs to register before opening a runtime.
+/// Programs and request handlers to register before opening a runtime.
 #[derive(Debug)]
-pub struct Builder(NonNull<sys::Builder>);
+pub struct Builder(pub(crate) NonNull<sys::Builder>);
 
 impl Builder {
     pub fn new() -> Result<Self> {
@@ -35,7 +35,7 @@ impl Builder {
             retries,
         } = P::OPTIONS;
         // SAFETY: builder is exclusively borrowed, kind is static, and the native library takes
-        // ownership of context on all paths and keeps it alive until release_program is called.
+        // ownership of context on all paths and keeps it alive until release_context is called.
         check(unsafe {
             sys::siphon_builder_program(
                 self.0.as_ptr(),
@@ -47,7 +47,7 @@ impl Builder {
                 retries.delay_max_ms,
                 context,
                 Some(run_program::<P>),
-                Some(release_program::<P>),
+                Some(release_context::<P>),
             )
         })?;
         Ok(self)
@@ -154,11 +154,12 @@ pub enum Ending<C, O> {
 }
 
 /// Wakes a waiting process when all named children have ended, any watched directory changes,
-/// or the deadline arrives.
+/// any named mail arrives, or the deadline arrives.
 #[derive(Debug, Clone, Default)]
 pub struct Wait {
     children: Vec<Vec<u8>>,
     changes: Vec<Vec<u8>>,
+    mail: Vec<String>,
     deadline: Option<i64>,
 }
 
@@ -176,6 +177,13 @@ impl Wait {
     #[must_use]
     pub fn change(mut self, path: impl Into<Vec<u8>>) -> Self {
         self.changes.push(path.into());
+        self
+    }
+
+    /// Waits for mail of this key, waking immediately if it is already present.
+    #[must_use]
+    pub fn mail(mut self, key: impl Into<String>) -> Self {
+        self.mail.push(key.into());
         self
     }
 
@@ -204,6 +212,7 @@ pub enum Outcome<O> {
 /// A phase's view of the last commit and the changes it is staging, valid during the callback.
 #[derive(Debug)]
 pub struct Run<'a> {
+    phase: &'a mut NonNull<sys::Run>,
     path: &'a [u8],
     time_ms: i64,
     stop_handler: bool,
@@ -213,13 +222,14 @@ pub struct Run<'a> {
 
 impl<'a> Run<'a> {
     /// Safety: `run` is a live, exclusive native callback handle for this borrow.
-    unsafe fn new(run: &'a mut NonNull<sys::Run>) -> Result<Self> {
-        let run = run.as_ptr();
+    unsafe fn new(phase: &'a mut NonNull<sys::Run>) -> Result<Self> {
+        let run = phase.as_ptr();
         let mut path = sys::Slice::default();
         let mut time_ms = 0;
         let mut stop_handler = 0;
         check(unsafe { sys::siphon_run_info(run, &mut path, &mut time_ms, &mut stop_handler) })?;
         Ok(Self {
+            phase,
             path: unsafe { borrow_slice(path) },
             time_ms,
             stop_handler: stop_handler != 0,
@@ -255,6 +265,69 @@ impl<'a> Run<'a> {
 
     pub fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         self.snapshot.outcome::<P>(process)
+    }
+
+    /// Stages a request and returns its mailbox key. Store the key in the checkpoint to read the
+    /// answer in a later phase.
+    pub fn request<R: Request>(&mut self, request: &R) -> Result<String> {
+        let mut key = sys::Buffer::default();
+        let payload = to_vec(request)?;
+        // SAFETY: the phase is live and exclusive, the slices are readable, and key is writable.
+        let status = unsafe {
+            sys::siphon_run_request(
+                self.phase.as_ptr(),
+                slice(R::NAME.as_bytes()),
+                slice(&payload),
+                &mut key,
+            )
+        };
+        let key = take(key);
+        check(status)?;
+        String::from_utf8(key).map_err(|error| Error {
+            code: 4,
+            message: format!("library returned an invalid request key: {error}"),
+        })
+    }
+
+    /// Reads the request's answer from this phase's snapshot. Returns `None` when it is absent.
+    pub fn answer<R: Request>(&self, key: &str) -> Result<Option<Answer<R::Answer>>> {
+        let mut kind = 0;
+        let mut payload = sys::Buffer::default();
+        // SAFETY: the phase and key are live for this call and both outputs are writable.
+        let status = unsafe {
+            sys::siphon_run_answer(
+                self.phase.as_ptr(),
+                slice(key.as_bytes()),
+                &mut kind,
+                &mut payload,
+            )
+        };
+        let payload = take(payload);
+        if !present(status)? {
+            return Ok(None);
+        }
+        let answer = match kind {
+            sys::ANSWER_GIVEN => from_slice(&payload).map_or_else(
+                |error| Answer::Failed(format!("the answer could not be read: {error}")),
+                Answer::Given,
+            ),
+            sys::ANSWER_FAILED => Answer::Failed(String::from_utf8_lossy(&payload).into_owned()),
+            sys::ANSWER_INTERRUPTED => Answer::Interrupted,
+            _ => {
+                return Err(Error {
+                    code: 4,
+                    message: format!("library returned an unknown answer kind: {kind}"),
+                });
+            }
+        };
+        Ok(Some(answer))
+    }
+
+    /// Stages removal of mail at `key` with the phase's other changes.
+    pub fn take_mail(&mut self, key: &str) -> Result<&mut Self> {
+        // SAFETY: the phase is live and exclusive, and key is readable for this call.
+        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_bytes())) })?;
+        Ok(self)
     }
 
     pub fn mkdir(&mut self, path: &[u8]) -> Result<&mut Self> {
@@ -319,11 +392,7 @@ unsafe extern "C" fn run_program<P: Program>(
             let _ = end(run, sys::END_THROW, error.message.as_bytes());
         }
         Err(panic) => {
-            let message = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("no message");
+            let message = panic_message(panic.as_ref());
             let _ = end(
                 run,
                 sys::END_THROW,
@@ -332,29 +401,6 @@ unsafe extern "C" fn run_program<P: Program>(
             discard_panic(panic);
         }
     }
-}
-
-unsafe extern "C" fn release_program<P: Program>(context: *mut c_void) {
-    // SAFETY: release is called once for the box created by Builder::program, after its final use.
-    let program = unsafe { Box::from_raw(context.cast::<P>()) };
-    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(program))) {
-        discard_panic(panic);
-    }
-}
-
-fn discard_panic(panic: Box<dyn Any + Send>) {
-    // A custom panic payload can itself panic on drop. Never let that unwind into C.
-    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(panic))) {
-        forget(panic);
-    }
-}
-
-/// Safety: the slice must remain readable for the returned borrow.
-unsafe fn borrow_slice<'a>(value: sys::Slice) -> &'a [u8] {
-    if value.len == 0 {
-        return &[];
-    }
-    unsafe { std::slice::from_raw_parts(value.data, value.len) }
 }
 
 fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) -> Result<()> {
@@ -369,6 +415,12 @@ fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) 
             for path in &wait.changes {
                 // SAFETY: as above, run and path are live for this call.
                 check(unsafe { sys::siphon_run_wait_for(run, sys::WAIT_CHANGE, slice(path)) })?;
+            }
+            for key in &wait.mail {
+                // SAFETY: as above, run and key are live for this call.
+                check(unsafe {
+                    sys::siphon_run_wait_for(run, sys::WAIT_MAIL, slice(key.as_bytes()))
+                })?;
             }
             if let Some(deadline) = wait.deadline {
                 // SAFETY: run is live throughout the callback.

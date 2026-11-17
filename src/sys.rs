@@ -22,6 +22,10 @@ pub struct Run {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct Reply {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Slice {
     pub data: *const u8,
     pub len: usize,
@@ -53,8 +57,25 @@ pub struct Status {
     pub error: Buffer,
 }
 
+#[repr(C)]
+pub struct Watch {
+    pub context: *mut c_void,
+    pub notify: Option<NotifyCallback>,
+    pub release: Option<ReleaseCallback>,
+}
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            notify: None,
+            release: None,
+        }
+    }
+}
+
 pub const WAIT_CHILD: u32 = 1;
 pub const WAIT_CHANGE: u32 = 2;
+pub const WAIT_MAIL: u32 = 3;
 pub const END_NEXT: u32 = 1;
 pub const END_WAIT: u32 = 2;
 pub const END_DONE: u32 = 3;
@@ -65,9 +86,16 @@ pub const OUTCOME_PENDING: u32 = 0;
 pub const OUTCOME_COMPLETED: u32 = 1;
 pub const OUTCOME_FAILED: u32 = 2;
 pub const OUTCOME_STOPPED: u32 = 3;
+pub const ANSWER_GIVEN: u32 = 1;
+pub const ANSWER_FAILED: u32 = 2;
+pub const ANSWER_INTERRUPTED: u32 = 3;
+pub const REQUEST_STOP: u32 = 1;
+pub const REQUEST_CLOSED: u32 = 2;
 
 type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, Slice, Slice);
 type ReleaseCallback = unsafe extern "C" fn(*mut c_void);
+type NotifyCallback = unsafe extern "C" fn(*mut c_void, u32);
+type DeliverCallback = unsafe extern "C" fn(*mut c_void, Slice, Slice, Slice, *mut Reply) -> Watch;
 
 unsafe extern "C" {
     pub fn siphon_abi_version() -> u32;
@@ -84,6 +112,13 @@ unsafe extern "C" {
         delay_max_ms: i64,
         context: *mut c_void,
         run: Option<PhaseCallback>,
+        release: Option<ReleaseCallback>,
+    ) -> Status;
+    pub fn siphon_builder_handle_request(
+        builder: *mut Builder,
+        name: Slice,
+        context: *mut c_void,
+        deliver: Option<DeliverCallback>,
         release: Option<ReleaseCallback>,
     ) -> Status;
     pub fn siphon_builder_open(
@@ -139,7 +174,22 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_run_changes(run: *mut Run) -> *mut Changes;
     pub fn siphon_run_snapshot(run: *const Run) -> *const Snapshot;
+    pub fn siphon_run_request(
+        run: *mut Run,
+        name: Slice,
+        payload: Slice,
+        key: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_run_answer(
+        run: *const Run,
+        key: Slice,
+        kind: *mut u32,
+        payload: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_run_take_mail(run: *mut Run, key: Slice) -> Status;
     pub fn siphon_run_wait_for(run: *mut Run, kind: u32, value: Slice) -> Status;
     pub fn siphon_run_wait_until(run: *mut Run, deadline: i64) -> Status;
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
+    pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
+    pub fn siphon_reply_free(reply: *mut Reply);
 }
