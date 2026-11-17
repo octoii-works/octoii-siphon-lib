@@ -16,7 +16,7 @@ fn main() {
         Some(target.as_str()),
         "Siphon target mismatch"
     );
-    assert_eq!(manifest["abi"].as_u64(), Some(1), "Siphon ABI mismatch");
+    assert_eq!(manifest["abi"].as_u64(), Some(2), "Siphon ABI mismatch");
     let filename = if target.contains("windows-msvc") {
         "siphon_native.lib"
     } else {

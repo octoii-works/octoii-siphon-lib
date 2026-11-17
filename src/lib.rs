@@ -1,9 +1,12 @@
 //! Safe Rust interface to a separately built Siphon binary.
-//! This development slice covers atomic changes, snapshots and persistent reopening.
+//! Register programs on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
+mod program;
 mod sys;
 
 use std::{path::Path, ptr::NonNull};
+
+pub use program::{Builder, Ending, Options, Outcome, Program, Retries, Run, Wait};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -16,6 +19,14 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self {
+            code: 4,
+            message: error.to_string(),
+        }
+    }
+}
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn slice(bytes: &[u8]) -> sys::Slice {
@@ -49,7 +60,7 @@ fn check(status: sys::Status) -> Result<()> {
 }
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
-    if unsafe { sys::siphon_abi_version() } == 1 {
+    if unsafe { sys::siphon_abi_version() } == 2 {
         Ok(())
     } else {
         Err(Error {
@@ -58,11 +69,22 @@ fn compatible() -> Result<()> {
         })
     }
 }
-fn owned<T>(ptr: *mut T) -> Result<NonNull<T>> {
+fn handle<T>(ptr: *mut T) -> Result<NonNull<T>> {
     NonNull::new(ptr).ok_or_else(|| Error {
         code: 4,
         message: "library returned a null handle".into(),
     })
+}
+
+/// The address of the process keyed by `key` under `parent`. An empty parent denotes the root.
+pub fn process_path(parent: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    compatible()?;
+    let mut out = sys::Buffer::default();
+    // SAFETY: slices are readable for the call and out is writable.
+    let status = unsafe { sys::siphon_process_path(slice(parent), slice(key), &mut out) };
+    let path = take(out);
+    check(status)?;
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -73,30 +95,16 @@ unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 impl Runtime {
     pub fn open(directory: &Path) -> Result<Self> {
-        let directory = directory
-            .to_str()
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| Error {
-                code: 2,
-                message: "directory must be nonempty UTF-8".into(),
-            })?;
-        Self::open_bytes(directory.as_bytes())
+        Builder::new()?.open(directory)
     }
     pub fn memory() -> Result<Self> {
-        Self::open_bytes(b"")
-    }
-    fn open_bytes(directory: &[u8]) -> Result<Self> {
-        compatible()?;
-        let mut out = std::ptr::null_mut();
-        // SAFETY: slice lives through the call; out is writable.
-        check(unsafe { sys::siphon_runtime_open(slice(directory), &mut out) })?;
-        Ok(Self(owned(out)?))
+        Builder::new()?.memory()
     }
     pub fn commit(&self, changes: &Changes) -> Result<u64> {
         let mut seq = 0;
         // SAFETY: handles remain live and changes are immutably borrowed during the call.
         check(unsafe {
-            sys::siphon_runtime_commit(self.0.as_ptr(), changes.0.as_ptr(), &mut seq)
+            sys::siphon_runtime_commit(self.0.as_ptr(), changes.0.0.as_ptr(), &mut seq)
         })?;
         Ok(seq)
     }
@@ -104,7 +112,7 @@ impl Runtime {
         let mut out = std::ptr::null_mut();
         // SAFETY: runtime is live; out is writable.
         check(unsafe { sys::siphon_runtime_snapshot(self.0.as_ptr(), &mut out) })?;
-        Ok(Snapshot(owned(out)?))
+        Ok(Snapshot(SnapshotHandle(handle(out)?)))
     }
     /// Stops execution. Retained snapshots remain readable and may retain the storage lock.
     pub fn close(&mut self) -> Result<()> {
@@ -120,7 +128,7 @@ impl Drop for Runtime {
 }
 
 #[derive(Debug)]
-pub struct Changes(NonNull<sys::Changes>);
+pub struct Changes(ChangeHandle);
 // SAFETY: the batch can move between threads; mutation still requires exclusive access.
 unsafe impl Send for Changes {}
 impl Changes {
@@ -129,72 +137,187 @@ impl Changes {
         let mut out = std::ptr::null_mut();
         // SAFETY: out is writable.
         check(unsafe { sys::siphon_changes_new(&mut out) })?;
-        Ok(Self(owned(out)?))
+        Ok(Self(ChangeHandle(handle(out)?)))
     }
     pub fn mkdir(&mut self, path: &[u8]) -> Result<&mut Self> {
-        // SAFETY: batch is exclusively borrowed, path lives for the call.
-        check(unsafe { sys::siphon_changes_mkdir(self.0.as_ptr(), slice(path)) })?;
+        self.0.mkdir(path)?;
         Ok(self)
     }
     pub fn write(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
-        // SAFETY: batch is exclusively borrowed, slices live for the call.
-        check(unsafe { sys::siphon_changes_write(self.0.as_ptr(), slice(path), slice(data)) })?;
+        self.0.write(path, data)?;
         Ok(self)
     }
     pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
-        // SAFETY: batch is exclusively borrowed, slices live for the call.
-        check(unsafe { sys::siphon_changes_append(self.0.as_ptr(), slice(path), slice(data)) })?;
+        self.0.append(path, data)?;
         Ok(self)
     }
     pub fn delete(&mut self, path: &[u8]) -> Result<&mut Self> {
-        // SAFETY: batch is exclusively borrowed, path lives for the call.
-        check(unsafe { sys::siphon_changes_delete(self.0.as_ptr(), slice(path)) })?;
+        self.0.delete(path)?;
+        Ok(self)
+    }
+    /// Stages a process start in this batch. An empty parent denotes the root.
+    pub fn start<P: Program>(
+        &mut self,
+        parent: &[u8],
+        key: &[u8],
+        input: &P::Input,
+    ) -> Result<&mut Self> {
+        self.0.start::<P>(parent, key, input)?;
+        Ok(self)
+    }
+    /// Stages a request for the process and its descendants to stop.
+    pub fn terminate(&mut self, process: &[u8]) -> Result<&mut Self> {
+        self.0.terminate(process)?;
         Ok(self)
     }
 }
 impl Drop for Changes {
     fn drop(&mut self) {
         // SAFETY: batch is uniquely owned and released once.
-        unsafe { sys::siphon_changes_free(self.0.as_ptr()) };
+        unsafe { sys::siphon_changes_free(self.0.0.as_ptr()) };
+    }
+}
+
+// A live handle backed by either an owned batch or the current phase.
+#[derive(Debug)]
+struct ChangeHandle(NonNull<sys::Changes>);
+
+impl ChangeHandle {
+    fn mkdir(&mut self, path: &[u8]) -> Result<()> {
+        // SAFETY: batch is exclusively borrowed, path lives for the call.
+        check(unsafe { sys::siphon_changes_mkdir(self.0.as_ptr(), slice(path)) })
+    }
+    fn write(&mut self, path: &[u8], data: &[u8]) -> Result<()> {
+        // SAFETY: batch is exclusively borrowed, slices live for the call.
+        check(unsafe { sys::siphon_changes_write(self.0.as_ptr(), slice(path), slice(data)) })
+    }
+    fn append(&mut self, path: &[u8], data: &[u8]) -> Result<()> {
+        // SAFETY: batch is exclusively borrowed, slices live for the call.
+        check(unsafe { sys::siphon_changes_append(self.0.as_ptr(), slice(path), slice(data)) })
+    }
+    fn delete(&mut self, path: &[u8]) -> Result<()> {
+        // SAFETY: batch is exclusively borrowed, path lives for the call.
+        check(unsafe { sys::siphon_changes_delete(self.0.as_ptr(), slice(path)) })
+    }
+    fn start<P: Program>(&mut self, parent: &[u8], key: &[u8], input: &P::Input) -> Result<()> {
+        let input = serde_json::to_vec(input)?;
+        // SAFETY: batch is exclusively borrowed, slices live for the call.
+        check(unsafe {
+            sys::siphon_changes_start(
+                self.0.as_ptr(),
+                slice(parent),
+                slice(key),
+                slice(P::KIND.as_bytes()),
+                P::VERSION,
+                slice(&input),
+            )
+        })
+    }
+    fn terminate(&mut self, process: &[u8]) -> Result<()> {
+        // SAFETY: batch is exclusively borrowed, process lives for the call.
+        check(unsafe { sys::siphon_changes_terminate(self.0.as_ptr(), slice(process)) })
     }
 }
 
 #[derive(Debug)]
-pub struct Snapshot(NonNull<sys::Snapshot>);
+pub struct Snapshot(SnapshotHandle);
 // SAFETY: native snapshots are immutable and support concurrent reads.
 unsafe impl Send for Snapshot {}
 // SAFETY: as above; Rust ownership prevents concurrent free.
 unsafe impl Sync for Snapshot {}
 impl Snapshot {
     pub fn sequence(&self) -> Result<u64> {
-        let mut seq = 0;
-        // SAFETY: live snapshot and writable output.
-        check(unsafe { sys::siphon_snapshot_seq(self.0.as_ptr(), &mut seq) })?;
-        Ok(seq)
+        self.0.sequence()
     }
     pub fn read(&self, path: &[u8]) -> Result<Option<Vec<u8>>> {
         self.read_range(path, 0, u64::MAX)
     }
     pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        let mut out = sys::Buffer {
-            data: std::ptr::null_mut(),
-            len: 0,
-        };
-        // SAFETY: snapshot is live, path borrowed for the call, output is writable.
-        let status = unsafe {
-            sys::siphon_snapshot_read(self.0.as_ptr(), slice(path), offset, length, &mut out)
-        };
-        let data = take(out);
-        match check(status) {
-            Ok(()) => Ok(Some(data)),
-            Err(error) if error.code == 1 => Ok(None),
-            Err(error) => Err(error),
-        }
+        self.0.read_range(path, offset, length)
+    }
+    /// Reads the outcome at `process`, returning `None` when the path has no process record.
+    pub fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+        self.0.outcome::<P>(process)
     }
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
         // SAFETY: snapshot is uniquely owned and released once.
-        unsafe { sys::siphon_snapshot_free(self.0.as_ptr()) };
+        unsafe { sys::siphon_snapshot_free(self.0.0.as_ptr()) };
     }
+}
+
+// A live handle backed by either a retained snapshot or the current phase.
+#[derive(Debug)]
+struct SnapshotHandle(NonNull<sys::Snapshot>);
+
+impl SnapshotHandle {
+    fn sequence(&self) -> Result<u64> {
+        let mut seq = 0;
+        // SAFETY: live snapshot and writable output.
+        check(unsafe { sys::siphon_snapshot_seq(self.0.as_ptr(), &mut seq) })?;
+        Ok(seq)
+    }
+    fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        let mut out = sys::Buffer::default();
+        // SAFETY: snapshot is live, path borrowed for the call, output is writable.
+        let status = unsafe {
+            sys::siphon_snapshot_read(self.0.as_ptr(), slice(path), offset, length, &mut out)
+        };
+        let data = take(out);
+        Ok(present(status)?.then_some(data))
+    }
+    fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+        let mut kind = sys::OUTCOME_PENDING;
+        let mut payload = sys::Buffer::default();
+        let mut reason = sys::Buffer::default();
+        // SAFETY: snapshot is live, process is readable for the call, outputs are writable.
+        let status = unsafe {
+            sys::siphon_snapshot_outcome(
+                self.0.as_ptr(),
+                slice(process),
+                &mut kind,
+                &mut payload,
+                &mut reason,
+            )
+        };
+        let payload = take(payload);
+        let reason = take(reason);
+        if !present(status)? {
+            return Ok(None);
+        }
+        let payload = (!payload.is_empty()).then_some(payload);
+        let reason = (!reason.is_empty()).then_some(reason);
+        let outcome = match kind {
+            sys::OUTCOME_PENDING => Outcome::Pending,
+            sys::OUTCOME_COMPLETED => Outcome::Completed(decode(payload.as_deref())?),
+            sys::OUTCOME_FAILED => Outcome::Failed {
+                error: payload,
+                reason,
+            },
+            sys::OUTCOME_STOPPED => Outcome::Stopped {
+                result: decode(payload.as_deref())?,
+                reason,
+            },
+            _ => {
+                return Err(Error {
+                    code: 4,
+                    message: format!("library returned an unknown outcome kind: {kind}"),
+                });
+            }
+        };
+        Ok(Some(outcome))
+    }
+}
+
+fn present(status: sys::Status) -> Result<bool> {
+    match check(status) {
+        Ok(()) => Ok(true),
+        Err(error) if error.code == 1 => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option<T>> {
+    Ok(bytes.map(serde_json::from_slice).transpose()?)
 }
