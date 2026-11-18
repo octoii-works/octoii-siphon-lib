@@ -7,8 +7,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    Builder, Request, RequestId, Result, Runtime, Snapshot, borrow_slice, check, discard_panic,
-    panic_message, release_context, slice, sys,
+    Builder, Request, RequestId, Result, RuntimeHandle, Snapshot, borrow_slice, check,
+    discard_panic, panic_message, release_context, slice, sys,
 };
 
 /// A request answered by a person, with a JSON Schema for the answer.
@@ -44,7 +44,7 @@ impl Builder {
     }
 }
 
-impl Runtime {
+impl RuntimeHandle {
     /// Reads person requests under `under` from a snapshot of this volume.
     pub fn person_requests(&self, snapshot: &Snapshot, under: &[u8]) -> Result<Vec<PersonRequest>> {
         let mut prompts: Result<Vec<PersonRequest>> = Ok(Vec::new());

@@ -245,6 +245,7 @@ unsafe extern "C" {
     pub fn siphon_abi_version() -> u32;
     pub fn siphon_buffer_free(buffer: Buffer);
     pub fn siphon_builder_new(out: *mut *mut Builder) -> Status;
+    pub fn siphon_builder_runtime(builder: *const Builder, out: *mut *const Runtime) -> Status;
     pub fn siphon_builder_free(builder: *mut Builder);
     pub fn siphon_builder_fiber(
         builder: *mut Builder,
@@ -278,7 +279,9 @@ unsafe extern "C" {
         out: *mut *mut Runtime,
     ) -> Status;
     pub fn siphon_runtime_close(runtime: *const Runtime) -> Status;
-    pub fn siphon_runtime_free(runtime: *mut Runtime) -> Status;
+    pub fn siphon_runtime_free(runtime: *const Runtime) -> Status;
+    pub fn siphon_runtime_retain(runtime: *const Runtime);
+    pub fn siphon_runtime_release(runtime: *const Runtime);
     pub fn siphon_runtime_commit(
         runtime: *const Runtime,
         changes: *const Changes,
@@ -443,5 +446,6 @@ unsafe extern "C" {
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
+    pub fn siphon_reply_runtime(reply: *const Reply, out: *mut *const Runtime) -> Status;
     pub fn siphon_reply_free(reply: *mut Reply);
 }

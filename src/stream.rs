@@ -3,7 +3,8 @@ use std::{ffi::c_void, ptr::NonNull};
 use tokio::sync::oneshot;
 
 use crate::{
-    Error, RequestId, Result, Runtime, borrow_slice, check, handle, release_context, slice, sys,
+    Error, RequestId, Result, RuntimeHandle, borrow_slice, check, handle, release_context, slice,
+    sys,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +35,7 @@ pub struct Following {
 // SAFETY: native serializes reads and a unique Rust owner cancels the follower.
 unsafe impl Send for Following {}
 
-impl Runtime {
+impl RuntimeHandle {
     /// Follows retained stream data and subsequent events on a topic.
     pub fn follow(&self, topic: &str) -> Result<Following> {
         let mut out = std::ptr::null_mut();

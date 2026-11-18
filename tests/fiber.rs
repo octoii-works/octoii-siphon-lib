@@ -164,7 +164,7 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let mut builder = Builder::new().unwrap();
     builder.fiber(Parent).unwrap().fiber(Child).unwrap();
-    let mut runtime = builder.open(directory.path()).unwrap();
+    let runtime = builder.open(directory.path()).unwrap();
     let path = process_path(b"", b"parent").unwrap();
     assert_eq!(
         runtime
@@ -627,7 +627,7 @@ fn registration_ownership_covers_rejection_failed_open_and_close() {
 
     let mut builder = Builder::new().unwrap();
     builder.fiber(Tracked(releases.clone())).unwrap();
-    let mut runtime = builder.memory().unwrap();
+    let runtime = builder.memory().unwrap();
     assert_eq!(count(), 3);
     runtime.close().unwrap();
     assert_eq!(count(), 4);
@@ -648,7 +648,7 @@ impl Fiber for CallbackOwner {
     type Output = ();
 
     fn run(&self, _: &mut Run<'_>, _: (), _: Option<()>) -> Result<Ending<(), ()>> {
-        let mut runtime = self.runtime.lock().unwrap().take().unwrap();
+        let runtime = self.runtime.lock().unwrap().take().unwrap();
         let open = Runtime::memory().unwrap_err().code;
         let commit = runtime.commit(&Changes::new()?).unwrap_err().code;
         let snapshot = runtime.snapshot().unwrap_err().code;

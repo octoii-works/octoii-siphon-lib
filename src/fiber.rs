@@ -13,8 +13,8 @@ use crate::Mail;
 
 use crate::{
     Answer, ChangeHandle, Entry, Error, FiberRecord, Found, NameChange, Query, Range, Request,
-    Result, Runtime, SnapshotHandle, borrow_slice, check, compatible, discard_panic, handle,
-    panic_message, present, release_context, slice, sys, take,
+    Result, Runtime, RuntimeHandle, SnapshotHandle, borrow_slice, check, compatible, discard_panic,
+    handle, panic_message, present, release_context, slice, sys, take,
 };
 
 /// Fibers and request handlers to register before opening a runtime.
@@ -28,6 +28,14 @@ impl Builder {
         // SAFETY: out points to writable storage.
         check(unsafe { sys::siphon_builder_new(&mut out) })?;
         Ok(Self(handle(out)?))
+    }
+
+    /// Retains access for services assembled before the runtime opens.
+    pub fn runtime_handle(&self) -> Result<RuntimeHandle> {
+        let mut result = std::ptr::null();
+        // SAFETY: the builder is live and result is writable.
+        check(unsafe { sys::siphon_builder_runtime(self.0.as_ptr(), &mut result) })?;
+        RuntimeHandle::from_retained(result)
     }
 
     /// Registers `fiber`. A rejected registration drops its fiber before returning.
@@ -80,7 +88,7 @@ impl Builder {
         // SAFETY: the native library consumes the builder on all paths. The directory is readable
         // for this call and out is writable.
         check(unsafe { sys::siphon_builder_open(builder.0.as_ptr(), slice(directory), &mut out) })?;
-        Ok(Runtime(handle(out)?))
+        Runtime::from_open(out)
     }
 }
 

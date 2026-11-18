@@ -329,7 +329,7 @@ fn wait_for_prompt(runtime: &Runtime, process: &[u8]) -> PersonRequest {
 #[test]
 fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer() {
     let directory = tempfile::tempdir().unwrap();
-    let mut runtime = person_builder().open(directory.path()).unwrap();
+    let runtime = person_builder().open(directory.path()).unwrap();
     let process = start::<Once>(&runtime, b"person", &42);
     let original = wait_for_prompt(&runtime, &process);
     assert_eq!(original.id.process, process);
@@ -422,7 +422,7 @@ async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
             }
         })
         .unwrap();
-    let mut runtime = builder.memory().unwrap();
+    let runtime = builder.memory().unwrap();
     let mut live = runtime.follow("thread").unwrap();
     assert_eq!(next_stream(&mut live).await, Some(StreamEvent::Reset));
     let process = start::<Once>(&runtime, b"streaming", &42);
@@ -485,25 +485,43 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     let (dropped, task_dropped) = mpsc::channel();
     let blocked = Mutex::new(Some(blocked));
     let mut builder = Builder::new().unwrap();
+    let prepared = builder.runtime_handle().unwrap();
+    assert_eq!(prepared.snapshot().unwrap_err().code, 3);
     builder
         .fiber(Once)
         .unwrap()
-        .handle::<Lookup, _, _>(executor.handle(), move |_| {
+        .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             let blocked = blocked.lock().unwrap().take().unwrap();
             let dropped = Dropped(dropped.clone());
             let started = started.clone();
             async move {
                 let _dropped = dropped;
-                started.send(()).unwrap();
+                let record = asked
+                    .runtime
+                    .snapshot()
+                    .unwrap()
+                    .fiber(&asked.id.process)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.created_seq, asked.id.started);
+                started.send(asked.runtime.clone()).unwrap();
                 // A poll already on the host executor can outlive native shutdown.
                 blocked.recv().unwrap();
                 pending().await
             }
         })
         .unwrap();
-    let mut runtime = builder.open(directory.path()).unwrap();
+    let runtime = builder.open(directory.path()).unwrap();
     let process = start::<Once>(&runtime, b"restart", &1);
-    running.recv_timeout(TIMEOUT).unwrap();
+    assert!(
+        prepared
+            .snapshot()
+            .unwrap()
+            .fiber(&process)
+            .unwrap()
+            .is_some()
+    );
+    let delivered = running.recv_timeout(TIMEOUT).unwrap();
     let (closed, done) = mpsc::channel();
     let close = thread::spawn(move || {
         runtime.close().unwrap();
@@ -513,6 +531,8 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     done.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(task_dropped.try_recv(), Err(mpsc::TryRecvError::Empty));
     close.join().unwrap();
+    assert_eq!(prepared.snapshot().unwrap_err().code, 3);
+    assert_eq!(delivered.snapshot().unwrap_err().code, 3);
 
     let deliveries = Arc::new(AtomicUsize::new(0));
     let mut builder = Builder::new().unwrap();

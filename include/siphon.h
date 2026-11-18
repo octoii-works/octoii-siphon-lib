@@ -146,6 +146,8 @@ enum { SIPHON_REQUEST_STOP = 1, SIPHON_REQUEST_CLOSED };
 uint32_t siphon_abi_version(void);
 void siphon_buffer_free(siphon_buffer buffer);
 siphon_status siphon_builder_new(siphon_builder **out);
+/* Retains a runtime reference for setup. Operations become available as the builder opens. */
+siphon_status siphon_builder_runtime(const siphon_builder *builder, const siphon_runtime **out);
 void siphon_builder_free(siphon_builder *builder);
 /* With non-null release, ownership of context transfers on every call, even on error.
  * Context must support concurrent phase invocations. Release runs after all invocations, or on
@@ -179,7 +181,12 @@ siphon_status siphon_builder_open(siphon_builder *builder, siphon_slice director
  * Free in that context releases the handle immediately and the runtime shuts down asynchronously.
  */
 siphon_status siphon_runtime_close(const siphon_runtime *runtime);
-siphon_status siphon_runtime_free(siphon_runtime *runtime);
+/* Free closes the runtime and consumes the reference obtained from open. Retained references
+ * may outlive the owner's free call. Release references from retain, builder or reply here.
+ */
+siphon_status siphon_runtime_free(const siphon_runtime *runtime);
+void siphon_runtime_retain(const siphon_runtime *runtime);
+void siphon_runtime_release(const siphon_runtime *runtime);
 siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, uint64_t *seq);
 siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snapshot **out);
 /* A follower starts with Reset, then replays retained data and follows the topic. */
@@ -262,6 +269,8 @@ siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key);
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
  */
 siphon_status siphon_reply_submit(const siphon_reply *reply, uint32_t kind, siphon_slice payload);
+/* Retains the delivery's runtime. Release it with siphon_runtime_release. */
+siphon_status siphon_reply_runtime(const siphon_reply *reply, const siphon_runtime **out);
 /* Publishes bytes on a UTF-8 topic for this reply's request. Status 3 means delivery is closed. */
 siphon_status siphon_reply_publish(const siphon_reply *reply, siphon_slice topic, siphon_slice data);
 void siphon_reply_free(siphon_reply *reply);

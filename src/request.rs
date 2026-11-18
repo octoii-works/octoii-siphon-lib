@@ -12,8 +12,8 @@ use tokio::{runtime::Handle, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Builder, Error, Result, borrow_slice, check, discard_panic, panic_message, release_context,
-    slice, sys,
+    Builder, Error, Result, RuntimeHandle, borrow_slice, check, discard_panic, panic_message,
+    release_context, slice, sys,
 };
 
 /// A request name, its typed payload, and the value returned by its handler.
@@ -61,6 +61,7 @@ impl RequestId {
 pub struct Asked<R> {
     pub id: RequestId,
     pub payload: R,
+    pub runtime: RuntimeHandle,
     /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
     pub cancelled: CancellationToken,
     delivery: Weak<Reply>,
@@ -194,14 +195,20 @@ where
         let signal = cancelled.clone();
         let handler = Arc::clone(&registration.handler);
         let delivery = Arc::downgrade(&reply);
+        let mut retained = std::ptr::null();
+        // SAFETY: the reply is live and retained is writable.
+        let runtime = check(unsafe { sys::siphon_reply_runtime(reply.0, &mut retained) })
+            .and_then(|()| RuntimeHandle::from_retained(retained));
         let task = registration.executor.spawn(async move {
             let answer = AssertUnwindSafe(async move {
                 let payload = serde_json::from_slice(&payload).map_err(|error| {
                     Unanswered::Failed(format!("the request could not be read: {error}"))
                 })?;
+                let runtime = runtime.map_err(|error| Unanswered::Failed(error.to_string()))?;
                 let given = handler(Asked {
                     id,
                     payload,
+                    runtime,
                     cancelled: signal,
                     delivery,
                 })

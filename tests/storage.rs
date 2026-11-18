@@ -5,7 +5,7 @@ use octoii_siphon_lib::{Changes, NameChange, Query, Range, Runtime};
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::open(directory.path()).unwrap();
+    let runtime = Runtime::open(directory.path()).unwrap();
     let mut first = Changes::new().unwrap();
     first
         .write(b"file", b"one")
@@ -38,7 +38,7 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
 
 #[test]
 fn directory_pages_and_entries_are_owned_after_runtime_close() {
-    let mut runtime = Runtime::memory().unwrap();
+    let runtime = Runtime::memory().unwrap();
     let mut changes = Changes::new().unwrap();
     changes
         .mkdir(b"data")
@@ -126,7 +126,7 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
 
 #[test]
 fn metadata_and_index_pages_follow_their_snapshot() {
-    let mut runtime = Runtime::memory().unwrap();
+    let runtime = Runtime::memory().unwrap();
     let mut changes = Changes::new().unwrap();
     changes
         .mkdir(b"team")
@@ -238,7 +238,7 @@ fn metadata_and_index_pages_follow_their_snapshot() {
 
 #[test]
 fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
-    let mut runtime = Runtime::memory().unwrap();
+    let runtime = Runtime::memory().unwrap();
     let initial = runtime.snapshot().unwrap().journal(0, 1).unwrap();
     assert!(initial.change_sets.is_empty());
     assert_eq!(
@@ -301,7 +301,7 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
 #[test]
 fn volume_ids_and_file_retention_survive_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::open(directory.path()).unwrap();
+    let runtime = Runtime::open(directory.path()).unwrap();
     let first = runtime.new_id().unwrap();
     assert_eq!(first.len(), 36);
     assert_eq!(first.as_bytes()[14], b'7');
@@ -363,7 +363,7 @@ fn volume_ids_and_file_retention_survive_reopening() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
-    let mut runtime = Runtime::memory().unwrap();
+    let runtime = Runtime::memory().unwrap();
     let mut watch = runtime.committed().unwrap();
     assert_eq!(
         watch.sequence(),

@@ -12,10 +12,12 @@ mod sys;
 use std::{
     any::Any,
     ffi::c_void,
-    mem::forget,
+    mem::{ManuallyDrop, forget},
+    ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr::NonNull,
+    sync::Arc,
 };
 
 use tokio::sync::watch;
@@ -154,12 +156,15 @@ pub fn process_path(parent: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     Ok(path)
 }
 
+/// Owns the running volume and its executor. The last owner starts shutdown.
+#[derive(Debug, Clone)]
+pub struct Runtime(Arc<Owner>);
+
 #[derive(Debug)]
-pub struct Runtime(NonNull<sys::Runtime>);
-// SAFETY: the native runtime serializes calls. Rust ownership prevents concurrent free.
-unsafe impl Send for Runtime {}
-// SAFETY: as above; closing requires an exclusive Rust borrow.
-unsafe impl Sync for Runtime {}
+struct Owner {
+    handle: ManuallyDrop<RuntimeHandle>,
+}
+
 impl Runtime {
     pub fn open(directory: &Path) -> Result<Self> {
         Builder::new()?.open(directory)
@@ -167,6 +172,64 @@ impl Runtime {
     pub fn memory() -> Result<Self> {
         Builder::new()?.memory()
     }
+
+    fn from_open(ptr: *mut sys::Runtime) -> Result<Self> {
+        Ok(Self(Arc::new(Owner {
+            handle: ManuallyDrop::new(RuntimeHandle(handle(ptr)?)),
+        })))
+    }
+
+    /// Stops execution and waits for the worker. Retained snapshots can still hold the volume lock.
+    pub fn close(&self) -> Result<()> {
+        // SAFETY: the owner's reference stays live during the call.
+        check(unsafe { sys::siphon_runtime_close(self.0.handle.0.as_ptr()) })
+    }
+}
+
+impl Deref for Runtime {
+    type Target = RuntimeHandle;
+
+    fn deref(&self) -> &RuntimeHandle {
+        &self.0.handle
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // SAFETY: native free consumes the runtime owner's reference exactly once.
+        let _ = check(unsafe { sys::siphon_runtime_free(self.handle.0.as_ptr()) });
+    }
+}
+
+/// Access to a runtime owned elsewhere. Commands reject use after the owner closes it.
+#[derive(Debug)]
+pub struct RuntimeHandle(NonNull<sys::Runtime>);
+
+// SAFETY: every handle owns a native reference and native serializes command admission.
+unsafe impl Send for RuntimeHandle {}
+// SAFETY: native commands accept concurrent callers.
+unsafe impl Sync for RuntimeHandle {}
+
+impl Clone for RuntimeHandle {
+    fn clone(&self) -> Self {
+        // SAFETY: this handle owns a live reference.
+        unsafe { sys::siphon_runtime_retain(self.0.as_ptr()) };
+        Self(self.0)
+    }
+}
+
+impl Drop for RuntimeHandle {
+    fn drop(&mut self) {
+        // SAFETY: this is the only release of this retained reference.
+        unsafe { sys::siphon_runtime_release(self.0.as_ptr()) };
+    }
+}
+
+impl RuntimeHandle {
+    fn from_retained(out: *const sys::Runtime) -> Result<Self> {
+        Ok(Self(handle(out.cast_mut())?))
+    }
+
     pub fn commit(&self, changes: &Changes) -> Result<u64> {
         let mut seq = 0;
         // SAFETY: handles remain live and changes are immutably borrowed during the call.
@@ -215,18 +278,6 @@ impl Runtime {
         let handle = handle(out)?;
         receiver.mark_unchanged();
         Ok(CommitWatch { handle, receiver })
-    }
-
-    /// Stops execution. Retained snapshots remain readable and may retain the storage lock.
-    pub fn close(&mut self) -> Result<()> {
-        // SAFETY: runtime is exclusively borrowed and remains allocated until Drop.
-        check(unsafe { sys::siphon_runtime_close(self.0.as_ptr()) })
-    }
-}
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        // SAFETY: this handle is uniquely owned and released once.
-        let _ = check(unsafe { sys::siphon_runtime_free(self.0.as_ptr()) });
     }
 }
 
