@@ -20,6 +20,7 @@ typedef struct siphon_builder siphon_builder;
 typedef struct siphon_run siphon_run;
 typedef struct siphon_reply siphon_reply;
 typedef struct siphon_commit_watch siphon_commit_watch;
+typedef struct siphon_following siphon_following;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
@@ -115,6 +116,15 @@ typedef struct {
     siphon_slice answer_schema;
 } siphon_person_request_view;
 typedef void (*siphon_person_visitor)(void *context, const siphon_person_request_view *request);
+enum { SIPHON_STREAM_RESET = 1, SIPHON_STREAM_DATA, SIPHON_STREAM_CLOSED };
+typedef struct {
+    uint32_t kind;
+    const siphon_request_id *id; /* Null for Reset. */
+    siphon_slice topic;
+    uint64_t offset;
+    siphon_slice data;
+} siphon_stream_view;
+typedef void (*siphon_stream_callback)(void *context, const siphon_stream_view *event);
 typedef struct {
     void *context;
     siphon_request_notify notify;
@@ -172,6 +182,15 @@ siphon_status siphon_runtime_close(const siphon_runtime *runtime);
 siphon_status siphon_runtime_free(siphon_runtime *runtime);
 siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, uint64_t *seq);
 siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snapshot **out);
+/* A follower starts with Reset, then replays retained data and follows the topic. */
+siphon_status siphon_runtime_follow(const siphon_runtime *runtime, siphon_slice topic, siphon_following **out);
+/* Queue a next read without blocking. A non-null context requires release, which takes ownership
+ * on every call. The callback borrows the event (null at end) only until it returns. Releasing
+ * the follower can discard queued callbacks, and always releases their contexts.
+ */
+siphon_status siphon_following_read(const siphon_following *following, void *context,
+    siphon_stream_callback receive, siphon_release_callback release);
+void siphon_following_free(siphon_following *following);
 /* Reads prompts from a snapshot of this volume. Each visitor borrows the view for the call. */
 siphon_status siphon_runtime_person_requests(const siphon_runtime *runtime, const siphon_snapshot *snapshot,
     siphon_slice under, void *context, siphon_person_visitor visit);
@@ -243,6 +262,8 @@ siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key);
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
  */
 siphon_status siphon_reply_submit(const siphon_reply *reply, uint32_t kind, siphon_slice payload);
+/* Publishes bytes on a UTF-8 topic for this reply's request. Status 3 means delivery is closed. */
+siphon_status siphon_reply_publish(const siphon_reply *reply, siphon_slice topic, siphon_slice data);
 void siphon_reply_free(siphon_reply *reply);
 /* Set one ending and copy its payload. Fail/Throw take UTF-8 messages; other endings use JSON.
  * Empty payload is allowed for a missing checkpoint or stopped result. No ending means a throw.

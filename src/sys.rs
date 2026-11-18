@@ -14,6 +14,10 @@ pub struct CommitWatch {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct Following {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Snapshot {
     _private: [u8; 0],
 }
@@ -183,6 +187,19 @@ pub struct PersonRequestView {
 type PersonVisitor = unsafe extern "C" fn(*mut c_void, *const PersonRequestView);
 
 #[repr(C)]
+pub struct StreamView {
+    pub kind: u32,
+    pub id: *const RequestId,
+    pub topic: Slice,
+    pub offset: u64,
+    pub data: Slice,
+}
+type StreamCallback = unsafe extern "C" fn(*mut c_void, *const StreamView);
+pub const STREAM_RESET: u32 = 1;
+pub const STREAM_DATA: u32 = 2;
+pub const STREAM_CLOSED: u32 = 3;
+
+#[repr(C)]
 pub struct Watch {
     pub context: *mut c_void,
     pub notify: Option<NotifyCallback>,
@@ -268,6 +285,18 @@ unsafe extern "C" {
         seq: *mut u64,
     ) -> Status;
     pub fn siphon_runtime_snapshot(runtime: *const Runtime, out: *mut *mut Snapshot) -> Status;
+    pub fn siphon_runtime_follow(
+        runtime: *const Runtime,
+        topic: Slice,
+        out: *mut *mut Following,
+    ) -> Status;
+    pub fn siphon_following_read(
+        following: *const Following,
+        context: *mut c_void,
+        receive: Option<StreamCallback>,
+        release: Option<ReleaseCallback>,
+    ) -> Status;
+    pub fn siphon_following_free(following: *mut Following);
     pub fn siphon_runtime_person_requests(
         runtime: *const Runtime,
         snapshot: *const Snapshot,
@@ -413,5 +442,6 @@ unsafe extern "C" {
     pub fn siphon_run_wait_until(run: *mut Run, deadline: i64) -> Status;
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
+    pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
     pub fn siphon_reply_free(reply: *mut Reply);
 }

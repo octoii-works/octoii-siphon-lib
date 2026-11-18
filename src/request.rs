@@ -3,7 +3,7 @@ use std::{
     fmt,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use futures_util::FutureExt;
@@ -12,7 +12,8 @@ use tokio::{runtime::Handle, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Builder, Result, borrow_slice, check, discard_panic, panic_message, release_context, slice, sys,
+    Builder, Error, Result, borrow_slice, check, discard_panic, panic_message, release_context,
+    slice, sys,
 };
 
 /// A request name, its typed payload, and the value returned by its handler.
@@ -62,6 +63,19 @@ pub struct Asked<R> {
     pub payload: R,
     /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
     pub cancelled: CancellationToken,
+    delivery: Weak<Reply>,
+}
+
+impl<R> Asked<R> {
+    /// Publishes bytes for this request while its delivery is open.
+    pub fn publish(&self, topic: &str, data: &[u8]) -> Result<()> {
+        let reply = self.delivery.upgrade().ok_or_else(|| Error {
+            code: 3,
+            message: "request delivery is closed".into(),
+        })?;
+        // SAFETY: reply is owned through this call, and topic and data remain readable.
+        check(unsafe { sys::siphon_reply_publish(reply.0, slice(topic.as_bytes()), slice(data)) })
+    }
 }
 
 /// The answer as read from a requesting process's mailbox.
@@ -135,11 +149,13 @@ struct Delivery {
 
 struct Reply(*mut sys::Reply);
 
-// SAFETY: the unique native reply handle can be submitted and freed on a host thread.
+// SAFETY: the native reply serializes publication and submission. Arc owns its lifetime.
 unsafe impl Send for Reply {}
+// SAFETY: as above, free occurs only once after all references are dropped.
+unsafe impl Sync for Reply {}
 
 impl Reply {
-    fn submit(self, answer: std::result::Result<Vec<u8>, Unanswered>) {
+    fn submit(&self, answer: std::result::Result<Vec<u8>, Unanswered>) {
         let (kind, payload) = match &answer {
             Ok(data) => (sys::ANSWER_GIVEN, data.as_slice()),
             Err(Unanswered::Failed(reason)) => (sys::ANSWER_FAILED, reason.as_bytes()),
@@ -169,7 +185,7 @@ where
     F: Fn(Asked<R>) -> A + Send + Sync + 'static,
     A: Future<Output = std::result::Result<R::Answer, Unanswered>> + Send + 'static,
 {
-    let reply = Reply(reply);
+    let reply = Arc::new(Reply(reply));
     let started = catch_unwind(AssertUnwindSafe(move || {
         // SAFETY: native keeps its registration and slices live throughout the callback.
         let registration = unsafe { &*context.cast::<Registration<F>>() };
@@ -177,6 +193,7 @@ where
         let cancelled = CancellationToken::new();
         let signal = cancelled.clone();
         let handler = Arc::clone(&registration.handler);
+        let delivery = Arc::downgrade(&reply);
         let task = registration.executor.spawn(async move {
             let answer = AssertUnwindSafe(async move {
                 let payload = serde_json::from_slice(&payload).map_err(|error| {
@@ -186,6 +203,7 @@ where
                     id,
                     payload,
                     cancelled: signal,
+                    delivery,
                 })
                 .await?;
                 serde_json::to_vec(&given).map_err(|error| {

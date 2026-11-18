@@ -6,6 +6,7 @@ mod fiber;
 mod person;
 mod request;
 mod snapshot;
+mod stream;
 mod sys;
 
 use std::{
@@ -26,6 +27,8 @@ use snapshot::SnapshotHandle;
 pub use snapshot::{
     ChangeSet, Directory, Entry, FiberRecord, Found, Journal, Query, Range, Snapshot,
 };
+
+pub use stream::{Following, Published, StreamEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {

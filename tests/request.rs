@@ -11,8 +11,9 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome,
-    PersonRequest, Request, Result, Run, Runtime, Signal, Unanswered, Wait, process_path,
+    Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Following, Mail, Options,
+    Outcome, PersonRequest, Published, Request, Result, Run, Runtime, Signal, StreamEvent,
+    Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +51,7 @@ fn finish<P: Fiber>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Lookup(u32);
 
 impl Request for Lookup {
@@ -389,6 +390,82 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
         runtime.person_requests(&standing, &process).unwrap(),
         vec![original]
     );
+}
+
+async fn next_stream(following: &mut Following) -> Option<StreamEvent> {
+    tokio::time::timeout(TIMEOUT, following.next())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
+    let (published, first_ready) = tokio::sync::oneshot::channel();
+    let (proceed, wait) = tokio::sync::oneshot::channel();
+    let (hold, held) = tokio::sync::oneshot::channel();
+    let gates = Mutex::new(Some((published, wait, hold)));
+    let mut builder = Builder::new().unwrap();
+    builder
+        .fiber(Once)
+        .unwrap()
+        .handle::<Lookup, _, _>(&tokio::runtime::Handle::current(), move |asked| {
+            let (published, wait, hold) = gates.lock().unwrap().take().unwrap();
+            async move {
+                asked.publish("thread", b"first").unwrap();
+                published.send(asked.id.clone()).unwrap();
+                wait.await.unwrap();
+                asked.publish("thread", b"second").unwrap();
+                let answer = asked.payload.0;
+                hold.send(asked).unwrap();
+                Ok(answer)
+            }
+        })
+        .unwrap();
+    let mut runtime = builder.memory().unwrap();
+    let mut live = runtime.follow("thread").unwrap();
+    assert_eq!(next_stream(&mut live).await, Some(StreamEvent::Reset));
+    let process = start::<Once>(&runtime, b"streaming", &42);
+    let id = tokio::time::timeout(TIMEOUT, first_ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id.process, process);
+    let part = |offset, data: &[u8]| {
+        Some(StreamEvent::Data(Published {
+            topic: "thread".into(),
+            id: id.clone(),
+            offset,
+            data: data.to_vec(),
+        }))
+    };
+    assert_eq!(next_stream(&mut live).await, part(0, b"first"));
+
+    let mut replay = runtime.follow("thread").unwrap();
+    assert_eq!(next_stream(&mut replay).await, Some(StreamEvent::Reset));
+    assert_eq!(next_stream(&mut replay).await, part(0, b"first"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), live.next())
+            .await
+            .is_err()
+    );
+
+    proceed.send(()).unwrap();
+    for following in [&mut live, &mut replay] {
+        assert_eq!(next_stream(following).await, part(1, b"second"));
+        assert_eq!(
+            next_stream(following).await,
+            Some(StreamEvent::Closed(id.clone()))
+        );
+    }
+    let asked = tokio::time::timeout(TIMEOUT, held).await.unwrap().unwrap();
+    assert_eq!(asked.publish("thread", b"late").unwrap_err().code, 3);
+    assert_eq!(
+        finish::<Once>(&runtime, &process),
+        Outcome::Completed(Some(Response::Given(42)))
+    );
+    runtime.close().unwrap();
+    assert_eq!(next_stream(&mut live).await, None);
 }
 
 struct Dropped(Sender<()>);
