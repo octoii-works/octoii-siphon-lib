@@ -10,8 +10,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
 use crate::{
-    Answer, ChangeHandle, Entry, Error, Range, Request, Result, Runtime, SnapshotHandle,
-    borrow_slice, check, compatible, discard_panic, handle, panic_message, present,
+    Answer, ChangeHandle, Entry, Error, Found, NameChange, Query, Range, Request, Result, Runtime,
+    SnapshotHandle, borrow_slice, check, compatible, discard_panic, handle, panic_message, present,
     release_context, slice, sys, take,
 };
 
@@ -262,6 +262,11 @@ impl<'a> Run<'a> {
         self.snapshot.list(path, range)
     }
 
+    /// Finds indexed directories in the immutable snapshot for this phase.
+    pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
+        self.snapshot.find(query, limit)
+    }
+
     pub fn sequence(&self) -> Result<u64> {
         self.snapshot.sequence()
     }
@@ -343,6 +348,17 @@ impl<'a> Run<'a> {
 
     pub fn mkdir(&mut self, path: &[u8]) -> Result<&mut Self> {
         self.changes.mkdir(path)?;
+        Ok(self)
+    }
+
+    /// Stages label and annotation changes for the phase's commit.
+    pub fn meta(
+        &mut self,
+        path: &[u8],
+        labels: &[NameChange<'_>],
+        annotations: &[NameChange<'_>],
+    ) -> Result<&mut Self> {
+        self.changes.meta(path, labels, annotations)?;
         Ok(self)
     }
 

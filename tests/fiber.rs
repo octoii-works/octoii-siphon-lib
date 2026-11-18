@@ -10,8 +10,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Builder, Changes, Ending, Error, Fiber, Options, Outcome, Range, Result, Run, Runtime,
-    Snapshot, Wait, process_path,
+    Builder, Changes, Ending, Error, Fiber, NameChange, Options, Outcome, Query, Range, Result,
+    Run, Runtime, Snapshot, Wait, process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,13 +59,32 @@ impl Fiber for Parent {
         assert_eq!(run.path(), process_path(b"", b"parent")?);
         assert!(run.time_ms() > 0 && run.sequence()? > 0);
         assert!(!run.is_stop_handler());
+        let gate = Query {
+            kind: b"gate",
+            name: b"state",
+            ..Query::default()
+        };
         match checkpoint {
             None => {
-                run.mkdir(b"gate")?.write(b"log", b"next")?;
+                run.mkdir(b"gate")?
+                    .meta(
+                        b"gate",
+                        &[NameChange {
+                            name: b"state",
+                            value: Some(b"ready"),
+                        }],
+                        &[],
+                    )?
+                    .write(b"log", b"next")?;
                 assert_eq!(run.read(b"log")?, None);
+                assert!(run.find(&gate, 1)?.is_empty());
                 Ok(Ending::Next(start))
             }
             Some(value) if value == start => {
+                let matches = run.find(&gate, 1)?;
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].path, b"gate");
+                assert_eq!(matches[0].value, b"ready");
                 let entry = run.stat(b"log")?.expect("the previous phase wrote log");
                 assert_eq!(entry.length, 4);
                 assert!(entry.directory.is_none());

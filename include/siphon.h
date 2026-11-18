@@ -42,7 +42,17 @@ typedef struct {
     size_t limit;
     uint8_t reverse;
 } siphon_snapshot_range;
+typedef struct {
+    siphon_slice kind;
+    siphon_slice name;
+    siphon_slice value;
+    siphon_slice under;
+    siphon_slice after;
+    size_t limit;
+} siphon_snapshot_query;
 typedef void (*siphon_entry_visitor)(void *context, const siphon_entry_view *entry);
+typedef void (*siphon_found_visitor)(void *context, siphon_slice path, siphon_slice value,
+    const siphon_entry_view *entry);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
@@ -95,6 +105,11 @@ siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snap
 siphon_status siphon_changes_new(siphon_changes **out);
 void siphon_changes_free(siphon_changes *changes);
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);
+/* The batch copies the metadata pairs during the call. A null, zero-length value removes the name.
+ * A non-null, zero-length value sets an empty value. An empty array leaves that metadata group intact.
+ */
+siphon_status siphon_changes_meta(siphon_changes *changes, siphon_slice path, siphon_named_slice labels,
+    siphon_named_slice annotations);
 siphon_status siphon_changes_write(siphon_changes *changes, siphon_slice path, siphon_slice data);
 siphon_status siphon_changes_append(siphon_changes *changes, siphon_slice path, siphon_slice data);
 siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
@@ -134,6 +149,13 @@ siphon_status siphon_snapshot_stat(const siphon_snapshot *snapshot, siphon_slice
     siphon_entry_visitor visit);
 siphon_status siphon_snapshot_list(const siphon_snapshot *snapshot, siphon_slice path, siphon_snapshot_range range,
     void *context, siphon_entry_visitor visit);
+/* Find returns up to limit matches in full byte path order. The visitor borrows path, value and entry.
+ * A null, zero-length value matches any value. A present value with zero length matches the empty value.
+ * An empty under path searches the root. After is an optional exclusive full path cursor.
+ * No matches is success with zero visits.
+ */
+siphon_status siphon_snapshot_find(const siphon_snapshot *snapshot, siphon_snapshot_query query, void *context,
+    siphon_found_visitor visit);
 siphon_status siphon_snapshot_read(const siphon_snapshot *snapshot, siphon_slice path, uint64_t offset, uint64_t length, siphon_buffer *out);
 siphon_status siphon_snapshot_seq(const siphon_snapshot *snapshot, uint64_t *out);
 /* Missing process returns status 1; absent payloads and reasons are empty buffers. */

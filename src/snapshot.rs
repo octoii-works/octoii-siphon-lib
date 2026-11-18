@@ -1,7 +1,11 @@
-use std::{ffi::c_void, ptr};
+use std::{
+    ffi::c_void,
+    ptr::{self, NonNull},
+};
 
-use crate::{Error, Fiber, Outcome, Result, borrow_slice, check, present, slice, sys, take};
-use std::ptr::NonNull;
+use crate::{
+    Error, Fiber, Outcome, Result, borrow_slice, check, optional_slice, present, slice, sys, take,
+};
 
 /// Directory labels and annotations are byte pairs. Sequences refer to committed volume changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +51,26 @@ pub struct Range<'a> {
     pub limit: usize,
 }
 
+/// Selects directories of one kind by their indexed label.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Query<'a> {
+    pub kind: &'a [u8],
+    pub name: &'a [u8],
+    /// An exact label value when present. None matches every value.
+    pub value: Option<&'a [u8]>,
+    /// The subtree to search. An empty path searches the root.
+    pub under: &'a [u8],
+    /// An exclusive cursor containing the previous match's full path.
+    pub after: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub path: Vec<u8>,
+    pub value: Vec<u8>,
+    pub entry: Entry,
+}
+
 #[derive(Debug)]
 pub struct Snapshot(pub(crate) SnapshotHandle);
 // SAFETY: native snapshots are immutable and support concurrent reads.
@@ -62,6 +86,11 @@ impl Snapshot {
     /// Reads a page in byte name order. A missing directory yields None and an empty page yields Some.
     pub fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
         self.0.list(path, range)
+    }
+
+    /// Finds indexed directories in full byte path order, up to the limit.
+    pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
+        self.0.find(query, limit)
     }
 
     pub fn sequence(&self) -> Result<u64> {
@@ -114,7 +143,7 @@ impl SnapshotHandle {
         let mut entries = Vec::new();
         let range = sys::SnapshotRange {
             prefix: slice(range.prefix),
-            after: range.after.map_or_else(sys::Slice::default, slice),
+            after: optional_slice(range.after),
             limit: range.limit,
             reverse: u8::from(range.reverse),
         };
@@ -129,6 +158,28 @@ impl SnapshotHandle {
             )
         };
         Ok(present(status)?.then_some(entries))
+    }
+
+    pub(crate) fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
+        let mut matches = Vec::new();
+        let query = sys::SnapshotQuery {
+            kind: slice(query.kind),
+            name: slice(query.name),
+            value: optional_slice(query.value),
+            under: slice(query.under),
+            after: optional_slice(query.after),
+            limit,
+        };
+        // SAFETY: the snapshot and query slices are live. The visitor has exclusive access to matches.
+        check(unsafe {
+            sys::siphon_snapshot_find(
+                self.0.as_ptr(),
+                query,
+                ptr::from_mut(&mut matches).cast(),
+                Some(collect_found),
+            )
+        })?;
+        Ok(matches)
     }
 
     pub(crate) fn sequence(&self) -> Result<u64> {
@@ -214,11 +265,10 @@ unsafe fn copy_named(values: &sys::NamedSlice) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-unsafe extern "C" fn collect_entry(context: *mut c_void, view: *const sys::EntryView) {
-    // SAFETY: the wrapper passes a live Vec<Entry> and the library supplies a borrowed view.
-    let (entries, view) = unsafe { (&mut *context.cast::<Vec<Entry>>(), &*view) };
-    // SAFETY: nested pointers are null or refer to data held until this function returns.
-    let entry = unsafe {
+/// Safety: the native entry and nested views must remain live for this copy.
+unsafe fn copy_entry(view: &sys::EntryView) -> Entry {
+    // SAFETY: nested pointers are null or refer to data held through this copy.
+    unsafe {
         Entry {
             name: borrow_slice(view.name).to_vec(),
             length: view.length,
@@ -230,8 +280,29 @@ unsafe extern "C" fn collect_entry(context: *mut c_void, view: *const sys::Entry
                 changed_seq: directory.changed_seq,
             }),
         }
-    };
-    entries.push(entry);
+    }
+}
+
+unsafe extern "C" fn collect_entry(context: *mut c_void, view: *const sys::EntryView) {
+    // SAFETY: the wrapper passes a live Vec<Entry> and the library supplies a borrowed entry.
+    unsafe { &mut *context.cast::<Vec<Entry>>() }.push(unsafe { copy_entry(&*view) });
+}
+
+unsafe extern "C" fn collect_found(
+    context: *mut c_void,
+    path: sys::Slice,
+    value: sys::Slice,
+    view: *const sys::EntryView,
+) {
+    // SAFETY: the wrapper passes a live Vec<Found> and the result is borrowed during this visit.
+    let matches = unsafe { &mut *context.cast::<Vec<Found>>() };
+    matches.push(unsafe {
+        Found {
+            path: borrow_slice(path).to_vec(),
+            value: borrow_slice(value).to_vec(),
+            entry: copy_entry(&*view),
+        }
+    });
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option<T>> {

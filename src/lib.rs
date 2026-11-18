@@ -19,7 +19,7 @@ use std::{
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use request::{Answer, Asked, Request, Unanswered};
 use snapshot::SnapshotHandle;
-pub use snapshot::{Directory, Entry, Range, Snapshot};
+pub use snapshot::{Directory, Entry, Found, Query, Range, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -47,6 +47,10 @@ fn slice(bytes: &[u8]) -> sys::Slice {
         data: bytes.as_ptr(),
         len: bytes.len(),
     }
+}
+
+fn optional_slice(bytes: Option<&[u8]>) -> sys::Slice {
+    bytes.map_or_else(sys::Slice::default, slice)
 }
 
 /// Safety: the slice must remain readable for the returned borrow.
@@ -173,6 +177,14 @@ impl Drop for Runtime {
     }
 }
 
+/// Sets or removes one directory label or annotation.
+#[derive(Debug, Clone, Copy)]
+pub struct NameChange<'a> {
+    pub name: &'a [u8],
+    /// None removes the name. An empty slice sets an empty value.
+    pub value: Option<&'a [u8]>,
+}
+
 #[derive(Debug)]
 pub struct Changes(ChangeHandle);
 // SAFETY: the batch can move between threads; mutation still requires exclusive access.
@@ -187,6 +199,16 @@ impl Changes {
     }
     pub fn mkdir(&mut self, path: &[u8]) -> Result<&mut Self> {
         self.0.mkdir(path)?;
+        Ok(self)
+    }
+    /// Stages label and annotation changes for a directory in this batch.
+    pub fn meta(
+        &mut self,
+        path: &[u8],
+        labels: &[NameChange<'_>],
+        annotations: &[NameChange<'_>],
+    ) -> Result<&mut Self> {
+        self.0.meta(path, labels, annotations)?;
         Ok(self)
     }
     pub fn write(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
@@ -232,6 +254,32 @@ impl ChangeHandle {
     fn mkdir(&mut self, path: &[u8]) -> Result<()> {
         // SAFETY: batch is exclusively borrowed, path lives for the call.
         check(unsafe { sys::siphon_changes_mkdir(self.0.as_ptr(), slice(path)) })
+    }
+    fn meta(
+        &mut self,
+        path: &[u8],
+        labels: &[NameChange<'_>],
+        annotations: &[NameChange<'_>],
+    ) -> Result<()> {
+        let encode = |updates: &[NameChange<'_>]| {
+            updates
+                .iter()
+                .map(|update| sys::NamedBytes {
+                    name: slice(update.name),
+                    value: optional_slice(update.value),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (labels, annotations) = (encode(labels), encode(annotations));
+        // SAFETY: the batch is exclusively borrowed. The library copies the live arrays and slices.
+        check(unsafe {
+            sys::siphon_changes_meta(
+                self.0.as_ptr(),
+                slice(path),
+                labels.as_slice().into(),
+                annotations.as_slice().into(),
+            )
+        })
     }
     fn write(&mut self, path: &[u8], data: &[u8]) -> Result<()> {
         // SAFETY: batch is exclusively borrowed, slices live for the call.

@@ -68,6 +68,14 @@ pub struct NamedSlice {
     pub data: *const NamedBytes,
     pub len: usize,
 }
+impl From<&[NamedBytes]> for NamedSlice {
+    fn from(values: &[NamedBytes]) -> Self {
+        Self {
+            data: values.as_ptr(),
+            len: values.len(),
+        }
+    }
+}
 #[repr(C)]
 pub struct DirectoryView {
     pub labels: NamedSlice,
@@ -89,7 +97,17 @@ pub struct SnapshotRange {
     pub limit: usize,
     pub reverse: u8,
 }
+#[repr(C)]
+pub struct SnapshotQuery {
+    pub kind: Slice,
+    pub name: Slice,
+    pub value: Slice,
+    pub under: Slice,
+    pub after: Slice,
+    pub limit: usize,
+}
 type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
+type FoundVisitor = unsafe extern "C" fn(*mut c_void, Slice, Slice, *const EntryView);
 
 #[repr(C)]
 pub struct Watch {
@@ -171,6 +189,12 @@ unsafe extern "C" {
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;
+    pub fn siphon_changes_meta(
+        changes: *mut Changes,
+        path: Slice,
+        labels: NamedSlice,
+        annotations: NamedSlice,
+    ) -> Status;
     pub fn siphon_changes_write(changes: *mut Changes, path: Slice, data: Slice) -> Status;
     pub fn siphon_changes_append(changes: *mut Changes, path: Slice, data: Slice) -> Status;
     pub fn siphon_changes_delete(changes: *mut Changes, path: Slice) -> Status;
@@ -196,6 +220,12 @@ unsafe extern "C" {
         range: SnapshotRange,
         context: *mut c_void,
         visit: Option<EntryVisitor>,
+    ) -> Status;
+    pub fn siphon_snapshot_find(
+        snapshot: *const Snapshot,
+        query: SnapshotQuery,
+        context: *mut c_void,
+        visit: Option<FoundVisitor>,
     ) -> Status;
     pub fn siphon_snapshot_read(
         snapshot: *const Snapshot,
