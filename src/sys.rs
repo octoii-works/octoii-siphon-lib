@@ -40,6 +40,14 @@ impl Default for Slice {
     }
 }
 #[repr(C)]
+pub struct MailView {
+    pub key: Slice,
+    pub name: Slice,
+    pub payload: Slice,
+}
+type MailVisitor = unsafe extern "C" fn(*mut c_void, *const MailView);
+
+#[repr(C)]
 pub struct Buffer {
     pub data: *mut u8,
     pub len: usize,
@@ -249,6 +257,12 @@ unsafe extern "C" {
         version: u32,
         input: Slice,
     ) -> Status;
+    pub fn siphon_changes_send(
+        changes: *mut Changes,
+        process: Slice,
+        mail: MailView,
+        started: *const u64,
+    ) -> Status;
     pub fn siphon_changes_signal(
         changes: *mut Changes,
         process: Slice,
@@ -327,6 +341,12 @@ unsafe extern "C" {
         key: Slice,
         kind: *mut u32,
         payload: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_run_mail(
+        run: *const Run,
+        key: Slice,
+        context: *mut c_void,
+        visit: Option<MailVisitor>,
     ) -> Status;
     pub fn siphon_run_take_mail(run: *mut Run, key: Slice) -> Status;
     pub fn siphon_run_wait_for(run: *mut Run, kind: u32, value: Slice) -> Status;

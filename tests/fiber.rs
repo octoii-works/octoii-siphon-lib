@@ -10,8 +10,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Builder, Changes, Ending, Error, Fiber, NameChange, Options, Outcome, Query, Range, Result,
-    Run, Runtime, Signal, Snapshot, Wait, process_path,
+    Builder, Changes, Ending, Error, Fiber, Mail, NameChange, Options, Outcome, Query, Range,
+    Result, Run, Runtime, Signal, Snapshot, Wait, process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -260,6 +260,92 @@ fn a_phase_and_its_runtime_allocate_from_the_same_volume() {
     let mut append = Changes::new().unwrap();
     append.append(b"phase-id", b"forbidden").unwrap();
     assert!(runtime.commit(&append).is_err());
+}
+
+const MAIL_KEY: &[u8] = b"report\xff";
+
+struct ReceivesMail;
+
+impl Fiber for ReceivesMail {
+    const KIND: &'static str = "contract.ordinary-mail";
+    type Input = ();
+    type Checkpoint = bool;
+    type Output = ();
+
+    fn run(&self, run: &mut Run<'_>, (): (), consumed: Option<bool>) -> Result<Ending<bool, ()>> {
+        let incoming = run.mail(MAIL_KEY)?;
+        if consumed == Some(true) {
+            assert_eq!(incoming, None);
+            assert_eq!(
+                run.mail(b"ack")?,
+                Some(Mail {
+                    key: b"ack".to_vec(),
+                    name: b"received".to_vec(),
+                    payload: Vec::new(),
+                })
+            );
+            return Ok(Ending::Done(()));
+        }
+        let Some(mail) = incoming else {
+            run.write(b"mail-ready", b"yes")?;
+            return Ok(Ending::Wait(false, Wait::new().mail(MAIL_KEY)));
+        };
+        assert_eq!(mail.key, MAIL_KEY);
+        assert_eq!(mail.name, b"notice\xfe");
+        assert_eq!(mail.payload, b"\x00\xff");
+        let process = run.path().to_vec();
+        let started = run.fiber(&process)?.unwrap().created_seq;
+        run.take_mail(MAIL_KEY)?.send(
+            &process,
+            &Mail {
+                key: b"ack".to_vec(),
+                name: b"received".to_vec(),
+                payload: Vec::new(),
+            },
+            Some(started),
+        )?;
+        assert_eq!(run.mail(MAIL_KEY)?, Some(mail));
+        assert_eq!(run.mail(b"ack")?, None);
+        Ok(Ending::Next(true))
+    }
+}
+
+#[test]
+fn byte_keyed_mail_wakes_the_right_fiber_and_is_consumed_on_commit() {
+    let mut builder = Builder::new().unwrap();
+    builder.fiber(ReceivesMail).unwrap();
+    let runtime = builder.memory().unwrap();
+    let process = start::<ReceivesMail>(&runtime, b"receiver", &());
+    let waiting = until(&runtime, |snapshot| {
+        snapshot.read(b"mail-ready").unwrap().is_some()
+    });
+    let started = waiting.fiber(&process).unwrap().unwrap().created_seq;
+    let mail = Mail {
+        key: MAIL_KEY.to_vec(),
+        name: b"notice\xfe".to_vec(),
+        payload: b"\x00\xff".to_vec(),
+    };
+    let mut stale = Changes::new().unwrap();
+    stale
+        .write(b"rolled-back", b"no")
+        .unwrap()
+        .send(&process, &mail, Some(started + 1))
+        .unwrap();
+    assert_eq!(runtime.commit(&stale).unwrap_err().code, 4);
+    assert_eq!(
+        runtime.snapshot().unwrap().read(b"rolled-back").unwrap(),
+        None
+    );
+
+    let mut send = Changes::new().unwrap();
+    send.send(&process, &mail, Some(started)).unwrap();
+    runtime.commit(&send).unwrap();
+    assert_eq!(
+        finished(&runtime, &process)
+            .outcome::<ReceivesMail>(&process)
+            .unwrap(),
+        Some(Outcome::Completed(Some(())))
+    );
 }
 
 struct ExitsFirst;

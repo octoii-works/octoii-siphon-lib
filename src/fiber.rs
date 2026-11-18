@@ -9,6 +9,8 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
+use crate::Mail;
+
 use crate::{
     Answer, ChangeHandle, Entry, Error, FiberRecord, Found, NameChange, Query, Range, Request,
     Result, Runtime, SnapshotHandle, borrow_slice, check, compatible, discard_panic, handle,
@@ -160,7 +162,7 @@ pub enum Ending<C, O> {
 pub struct Wait {
     children: Vec<Vec<u8>>,
     changes: Vec<Vec<u8>>,
-    mail: Vec<String>,
+    mail: Vec<Vec<u8>>,
     deadline: Option<i64>,
 }
 
@@ -183,7 +185,7 @@ impl Wait {
 
     /// Waits for mail of this key, waking immediately if it is already present.
     #[must_use]
-    pub fn mail(mut self, key: impl Into<String>) -> Self {
+    pub fn mail(mut self, key: impl Into<Vec<u8>>) -> Self {
         self.mail.push(key.into());
         self
     }
@@ -354,9 +356,31 @@ impl<'a> Run<'a> {
     }
 
     /// Stages removal of mail at `key` with the phase's other changes.
-    pub fn take_mail(&mut self, key: &str) -> Result<&mut Self> {
+    /// Reads a mailbox entry from the immutable phase snapshot.
+    pub fn mail(&self, key: &[u8]) -> Result<Option<Mail>> {
+        let mut mail: Option<Mail> = None;
+        // SAFETY: the phase and key are live. The visitor writes into mail exclusively.
+        let status = unsafe {
+            sys::siphon_run_mail(
+                self.phase.as_ptr(),
+                slice(key),
+                std::ptr::from_mut(&mut mail).cast(),
+                Some(collect_mail),
+            )
+        };
+        if !present(status)? {
+            return Ok(None);
+        }
+        mail.map(Some).ok_or_else(|| Error {
+            code: 4,
+            message: "Siphon returned no mail for a successful mailbox read".into(),
+        })
+    }
+
+    /// Stages consumption in the phase's commit.
+    pub fn take_mail(&mut self, key: impl AsRef<[u8]>) -> Result<&mut Self> {
         // SAFETY: the phase is live and exclusive, and key is readable for this call.
-        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_bytes())) })?;
+        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_ref())) })?;
         Ok(self)
     }
 
@@ -411,6 +435,12 @@ impl<'a> Run<'a> {
         Ok(self)
     }
 
+    /// Stages mail. A started sequence fences delivery to that Fiber incarnation.
+    pub fn send(&mut self, process: &[u8], mail: &Mail, started: Option<u64>) -> Result<&mut Self> {
+        self.changes.send(process, mail, started)?;
+        Ok(self)
+    }
+
     /// Stages a signal to the Fiber and its descendants.
     pub fn signal(
         &mut self,
@@ -445,6 +475,19 @@ impl<'a> Run<'a> {
         self.changes.charge(process, counters)?;
         Ok(self)
     }
+}
+
+unsafe extern "C" fn collect_mail(context: *mut c_void, view: *const sys::MailView) {
+    // SAFETY: the wrapper supplies an exclusive slot and the library lends a live mail view.
+    let (mail, view) = unsafe { (&mut *context.cast::<Option<Mail>>(), &*view) };
+    // SAFETY: all three slices are readable during this visit.
+    *mail = Some(unsafe {
+        Mail {
+            key: borrow_slice(view.key).to_vec(),
+            name: borrow_slice(view.name).to_vec(),
+            payload: borrow_slice(view.payload).to_vec(),
+        }
+    });
 }
 
 unsafe extern "C" fn run_fiber<P: Fiber>(
@@ -499,9 +542,7 @@ fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) 
             }
             for key in &wait.mail {
                 // SAFETY: as above, run and key are live for this call.
-                check(unsafe {
-                    sys::siphon_run_wait_for(run, sys::WAIT_MAIL, slice(key.as_bytes()))
-                })?;
+                check(unsafe { sys::siphon_run_wait_for(run, sys::WAIT_MAIL, slice(key)) })?;
             }
             if let Some(deadline) = wait.deadline {
                 // SAFETY: run is live throughout the callback.

@@ -223,6 +223,14 @@ pub enum Signal {
     Continue = 6,
 }
 
+/// Named mail addressed by a byte key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mail {
+    pub key: Vec<u8>,
+    pub name: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub struct Changes(ChangeHandle);
 // SAFETY: the batch can move between threads; mutation still requires exclusive access.
@@ -281,6 +289,12 @@ impl Changes {
         self.0.start::<P>(parent, key, input)?;
         Ok(self)
     }
+    /// Stages mail. A started sequence fences delivery to that Fiber incarnation.
+    pub fn send(&mut self, process: &[u8], mail: &Mail, started: Option<u64>) -> Result<&mut Self> {
+        self.0.send(process, mail, started)?;
+        Ok(self)
+    }
+
     /// Stages a signal to the Fiber and its descendants.
     pub fn signal(
         &mut self,
@@ -390,6 +404,18 @@ impl ChangeHandle {
                 slice(&input),
             )
         })
+    }
+    fn send(&mut self, process: &[u8], mail: &Mail, started: Option<u64>) -> Result<()> {
+        let mail = sys::MailView {
+            key: slice(&mail.key),
+            name: slice(&mail.name),
+            payload: slice(&mail.payload),
+        };
+        let started = started
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the batch is exclusively borrowed. The library copies all the live inputs.
+        check(unsafe { sys::siphon_changes_send(self.0.as_ptr(), slice(process), mail, started) })
     }
     fn signal(&mut self, process: &[u8], signal: Signal, reason: Option<&[u8]>) -> Result<()> {
         // SAFETY: the batch is exclusively borrowed and both input slices are live.

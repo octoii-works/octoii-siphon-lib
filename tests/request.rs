@@ -11,8 +11,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Answer, Asked, Builder, Changes, Ending, Error, Fiber, Options, Outcome, Request, Result, Run,
-    Runtime, Signal, Unanswered, Wait, process_path,
+    Answer, Asked, Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome, Request, Result,
+    Run, Runtime, Signal, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -258,7 +258,7 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             let started = started.clone();
             async move {
-                started.send(asked.process).unwrap();
+                started.send((asked.process, asked.key)).unwrap();
                 asked.cancelled.cancelled().await;
                 Ok(asked.payload.0)
             }
@@ -266,7 +266,24 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         .unwrap();
     let runtime = builder.memory().unwrap();
     let process = start::<Once>(&runtime, b"stop", &42);
-    assert_eq!(running.recv_timeout(TIMEOUT).unwrap(), process);
+    let (asked_process, key) = running.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(asked_process, process);
+    let mut conflicting = Changes::new().unwrap();
+    conflicting
+        .send(
+            &process,
+            &Mail {
+                key: key.into_bytes(),
+                name: b"ordinary".to_vec(),
+                payload: b"reserved".to_vec(),
+            },
+            None,
+        )
+        .unwrap();
+    let error = runtime.commit(&conflicting).unwrap_err();
+    assert_eq!(error.code, 4);
+    assert!(error.message.contains("request-pending"), "{error}");
+
     let mut changes = Changes::new().unwrap();
     changes.signal(&process, Signal::Terminate, None).unwrap();
     runtime.commit(&changes).unwrap();

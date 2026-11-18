@@ -22,6 +22,12 @@ typedef struct siphon_reply siphon_reply;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
+typedef struct {
+    siphon_slice key;
+    siphon_slice name;
+    siphon_slice payload;
+} siphon_mail_view;
+typedef void (*siphon_mail_visitor)(void *context, const siphon_mail_view *mail);
 typedef struct { siphon_slice name; siphon_slice value; } siphon_named_bytes;
 typedef struct { const siphon_named_bytes *data; size_t len; } siphon_named_slice;
 typedef struct {
@@ -157,6 +163,9 @@ siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
 siphon_status siphon_process_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
 siphon_status siphon_changes_start(siphon_changes *changes, siphon_slice parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
+/* The batch copies the mail. A non-null started sequence fences delivery to that Fiber incarnation. */
+siphon_status siphon_changes_send(siphon_changes *changes, siphon_slice process, siphon_mail_view mail,
+    const uint64_t *started);
 /* Reasons are optional bytes. A null, zero-length slice omits the reason.
  * Remove lets stop handlers run. Force remove kills live Fibers before discarding the subtree.
  */
@@ -180,6 +189,11 @@ siphon_status siphon_run_wait_until(siphon_run *run, int64_t deadline);
  */
 siphon_status siphon_run_request(siphon_run *run, siphon_slice name, siphon_slice payload, siphon_buffer *key);
 siphon_status siphon_run_answer(const siphon_run *run, siphon_slice key, uint32_t *kind, siphon_buffer *payload);
+/* A synchronous visitor borrows the phase's mail. An absent entry returns status 1.
+ * The visitor must not unwind or mutate the phase. Mail keys, names and payloads are bytes.
+ * Take stages consumption for the phase's commit.
+ */
+siphon_status siphon_run_mail(const siphon_run *run, siphon_slice key, void *context, siphon_mail_visitor visit);
 siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key);
 /* Submit a JSON answer, UTF-8 failure or empty interruption. Success only means queued.
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
