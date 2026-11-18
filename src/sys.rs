@@ -10,6 +10,10 @@ pub struct Runtime {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct CommitWatch {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Snapshot {
     _private: [u8; 0],
 }
@@ -189,6 +193,7 @@ pub const REQUEST_CLOSED: u32 = 2;
 
 type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, Slice, Slice);
 type ReleaseCallback = unsafe extern "C" fn(*mut c_void);
+type CommitCallback = unsafe extern "C" fn(*mut c_void, u64);
 type NotifyCallback = unsafe extern "C" fn(*mut c_void, u32);
 type DeliverCallback = unsafe extern "C" fn(*mut c_void, Slice, Slice, Slice, *mut Reply) -> Watch;
 
@@ -231,6 +236,14 @@ unsafe extern "C" {
     pub fn siphon_runtime_snapshot(runtime: *const Runtime, out: *mut *mut Snapshot) -> Status;
     pub fn siphon_runtime_new_id(runtime: *const Runtime, out: *mut Buffer) -> Status;
     pub fn siphon_runtime_now_ms(runtime: *const Runtime, out: *mut i64) -> Status;
+    pub fn siphon_runtime_watch_commits(
+        runtime: *const Runtime,
+        context: *mut c_void,
+        notify: Option<CommitCallback>,
+        release: Option<ReleaseCallback>,
+        out: *mut *mut CommitWatch,
+    ) -> Status;
+    pub fn siphon_commit_watch_free(watch: *mut CommitWatch);
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;

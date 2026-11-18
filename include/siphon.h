@@ -19,6 +19,7 @@ typedef struct siphon_changes siphon_changes;
 typedef struct siphon_builder siphon_builder;
 typedef struct siphon_run siphon_run;
 typedef struct siphon_reply siphon_reply;
+typedef struct siphon_commit_watch siphon_commit_watch;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
@@ -92,6 +93,7 @@ typedef void (*siphon_journal_visitor)(void *context, const siphon_journal_view 
 typedef void (*siphon_fiber_visitor)(void *context, const siphon_fiber_record_view *record);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
+typedef void (*siphon_commit_callback)(void *context, uint64_t seq);
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
 typedef struct {
     void *context;
@@ -146,6 +148,15 @@ siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snap
 /* IDs are UTF-8 UUIDv7 values from the volume. Free the buffer with siphon_buffer_free. */
 siphon_status siphon_runtime_new_id(const siphon_runtime *runtime, siphon_buffer *out);
 siphon_status siphon_runtime_now_ms(const siphon_runtime *runtime, int64_t *out);
+/* Watch delivers its initial sequence before returning success. Subsequent notifications may
+ * coalesce commits. The journal supplies change details. With release, ownership of context
+ * transfers on every call. A non-null context requires release. Callbacks return promptly and
+ * must not unwind or make blocking runtime calls.
+ */
+siphon_status siphon_runtime_watch_commits(const siphon_runtime *runtime, void *context,
+    siphon_commit_callback notify, siphon_release_callback release, siphon_commit_watch **out);
+/* Requests cancellation. Release runs after the last notification, including during runtime close. */
+void siphon_commit_watch_free(siphon_commit_watch *watch);
 siphon_status siphon_changes_new(siphon_changes **out);
 void siphon_changes_free(siphon_changes *changes);
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);

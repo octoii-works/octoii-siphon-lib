@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use octoii_siphon_lib::{Changes, NameChange, Query, Range, Runtime};
 
 #[test]
@@ -357,6 +359,60 @@ fn volume_ids_and_file_retention_survive_reopening() {
         None
     );
     assert_eq!(reopened.commit(&blocked).unwrap_err().code, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
+    let mut runtime = Runtime::memory().unwrap();
+    let mut watch = runtime.committed().unwrap();
+    assert_eq!(
+        watch.sequence(),
+        runtime.snapshot().unwrap().sequence().unwrap()
+    );
+
+    let mut rejected = Changes::new().unwrap();
+    rejected.write(b"absent/child", b"no").unwrap();
+    assert!(runtime.commit(&rejected).is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), watch.changed())
+            .await
+            .is_err()
+    );
+
+    let mut batch = Changes::new().unwrap();
+    batch.write(b"file", b"one").unwrap();
+    let first = runtime.commit(&batch).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), watch.changed())
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+
+    let cancelled = runtime.committed().unwrap();
+    assert_eq!(cancelled.sequence(), first);
+    drop(cancelled);
+    let mut next = Changes::new().unwrap();
+    next.write(b"file", b"two").unwrap();
+    let second = runtime.commit(&next).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), watch.changed())
+            .await
+            .unwrap()
+            .unwrap(),
+        second
+    );
+    let journal = runtime.snapshot().unwrap().journal(first, 1).unwrap();
+    assert_eq!(journal.through, second);
+    assert_eq!(journal.change_sets[0].paths, [b"file".to_vec()]);
+
+    runtime.close().unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        .await
+        .unwrap();
+    assert!(closed.is_err());
+    assert_eq!(runtime.committed().unwrap_err().code, 3);
 }
 
 #[test]

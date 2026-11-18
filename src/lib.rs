@@ -16,6 +16,8 @@ use std::{
     ptr::NonNull,
 };
 
+use tokio::sync::watch;
+
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use request::{Answer, Asked, Request, Unanswered};
 use snapshot::SnapshotHandle;
@@ -190,6 +192,26 @@ impl Runtime {
         Ok(now)
     }
 
+    /// Watches the latest committed sequence. Read the snapshot journal for change details.
+    pub fn committed(&self) -> Result<CommitWatch> {
+        let (sender, mut receiver) = watch::channel(0);
+        let context = Box::into_raw(Box::new(sender)).cast();
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the runtime and output are live. The native call takes ownership of context.
+        check(unsafe {
+            sys::siphon_runtime_watch_commits(
+                self.0.as_ptr(),
+                context,
+                Some(received_commit),
+                Some(release_context::<watch::Sender<u64>>),
+                &mut out,
+            )
+        })?;
+        let handle = handle(out)?;
+        receiver.mark_unchanged();
+        Ok(CommitWatch { handle, receiver })
+    }
+
     /// Stops execution. Retained snapshots remain readable and may retain the storage lock.
     pub fn close(&mut self) -> Result<()> {
         // SAFETY: runtime is exclusively borrowed and remains allocated until Drop.
@@ -201,6 +223,42 @@ impl Drop for Runtime {
         // SAFETY: this handle is uniquely owned and released once.
         let _ = check(unsafe { sys::siphon_runtime_free(self.0.as_ptr()) });
     }
+}
+
+/// Observes the latest committed sequence. Notifications can coalesce commits.
+#[derive(Debug)]
+pub struct CommitWatch {
+    handle: NonNull<sys::CommitWatch>,
+    receiver: watch::Receiver<u64>,
+}
+
+// SAFETY: the native watch is owned. Its only operation here is cancellation on drop.
+unsafe impl Send for CommitWatch {}
+
+impl CommitWatch {
+    /// The latest sequence delivered to this watch.
+    pub fn sequence(&self) -> u64 {
+        *self.receiver.borrow()
+    }
+
+    /// Waits for progress and returns the latest sequence. Closing the runtime ends the watch.
+    pub async fn changed(&mut self) -> std::result::Result<u64, watch::error::RecvError> {
+        self.receiver.changed().await?;
+        Ok(*self.receiver.borrow_and_update())
+    }
+}
+
+impl Drop for CommitWatch {
+    fn drop(&mut self) {
+        // SAFETY: the handle is uniquely owned and freed once.
+        unsafe { sys::siphon_commit_watch_free(self.handle.as_ptr()) };
+    }
+}
+
+unsafe extern "C" fn received_commit(context: *mut c_void, seq: u64) {
+    // SAFETY: the native registration keeps the boxed sender alive through its last notification.
+    let sender = unsafe { &*context.cast::<watch::Sender<u64>>() };
+    sender.send_replace(seq);
 }
 
 /// Sets or removes one directory label or annotation.
