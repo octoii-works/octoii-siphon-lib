@@ -411,8 +411,38 @@ impl<'a> Run<'a> {
         Ok(self)
     }
 
-    pub fn terminate(&mut self, process: &[u8]) -> Result<&mut Self> {
-        self.changes.terminate(process)?;
+    /// Stages a signal to the Fiber and its descendants.
+    pub fn signal(
+        &mut self,
+        process: &[u8],
+        signal: crate::Signal,
+        reason: Option<&[u8]>,
+    ) -> Result<&mut Self> {
+        self.changes.signal(process, signal, reason)?;
+        Ok(self)
+    }
+
+    /// Stages removal after the Fibers under path have had a chance to stop.
+    pub fn remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
+        self.changes.remove(path, reason)?;
+        Ok(self)
+    }
+
+    /// Stages removal by killing live Fibers under path.
+    pub fn force_remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
+        self.changes.force_remove(path, reason)?;
+        Ok(self)
+    }
+
+    /// Stages reaping an ended Fiber record.
+    pub fn reap(&mut self, process: &[u8]) -> Result<&mut Self> {
+        self.changes.reap(process)?;
+        Ok(self)
+    }
+
+    /// Stages usage charges to the Fiber and its ancestors.
+    pub fn charge(&mut self, process: &[u8], counters: &[(&[u8], u64)]) -> Result<&mut Self> {
+        self.changes.charge(process, counters)?;
         Ok(self)
     }
 }

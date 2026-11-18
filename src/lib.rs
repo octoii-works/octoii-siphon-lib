@@ -211,6 +211,18 @@ pub struct NameChange<'a> {
     pub value: Option<&'a [u8]>,
 }
 
+/// A signal for a Fiber and its descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Signal {
+    Hangup = 1,
+    Interrupt = 2,
+    Terminate = 3,
+    Kill = 4,
+    Stop = 5,
+    Continue = 6,
+}
+
 #[derive(Debug)]
 pub struct Changes(ChangeHandle);
 // SAFETY: the batch can move between threads; mutation still requires exclusive access.
@@ -269,9 +281,34 @@ impl Changes {
         self.0.start::<P>(parent, key, input)?;
         Ok(self)
     }
-    /// Stages a request for the process and its descendants to stop.
-    pub fn terminate(&mut self, process: &[u8]) -> Result<&mut Self> {
-        self.0.terminate(process)?;
+    /// Stages a signal to the Fiber and its descendants.
+    pub fn signal(
+        &mut self,
+        process: &[u8],
+        signal: Signal,
+        reason: Option<&[u8]>,
+    ) -> Result<&mut Self> {
+        self.0.signal(process, signal, reason)?;
+        Ok(self)
+    }
+    /// Stages removal after the Fibers under path have had a chance to stop.
+    pub fn remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
+        self.0.remove(path, reason)?;
+        Ok(self)
+    }
+    /// Stages removal by killing live Fibers under path.
+    pub fn force_remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
+        self.0.force_remove(path, reason)?;
+        Ok(self)
+    }
+    /// Stages reaping an ended Fiber record.
+    pub fn reap(&mut self, process: &[u8]) -> Result<&mut Self> {
+        self.0.reap(process)?;
+        Ok(self)
+    }
+    /// Stages usage charges to the Fiber and its ancestors.
+    pub fn charge(&mut self, process: &[u8], counters: &[(&[u8], u64)]) -> Result<&mut Self> {
+        self.0.charge(process, counters)?;
         Ok(self)
     }
 }
@@ -354,9 +391,50 @@ impl ChangeHandle {
             )
         })
     }
-    fn terminate(&mut self, process: &[u8]) -> Result<()> {
-        // SAFETY: batch is exclusively borrowed, process lives for the call.
-        check(unsafe { sys::siphon_changes_terminate(self.0.as_ptr(), slice(process)) })
+    fn signal(&mut self, process: &[u8], signal: Signal, reason: Option<&[u8]>) -> Result<()> {
+        // SAFETY: the batch is exclusively borrowed and both input slices are live.
+        check(unsafe {
+            sys::siphon_changes_signal(
+                self.0.as_ptr(),
+                slice(process),
+                signal as u32,
+                optional_slice(reason),
+            )
+        })
+    }
+    fn remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<()> {
+        // SAFETY: the batch is exclusively borrowed and both input slices are live.
+        check(unsafe {
+            sys::siphon_changes_remove(self.0.as_ptr(), slice(path), optional_slice(reason))
+        })
+    }
+    fn force_remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<()> {
+        // SAFETY: the batch is exclusively borrowed and both input slices are live.
+        check(unsafe {
+            sys::siphon_changes_force_remove(self.0.as_ptr(), slice(path), optional_slice(reason))
+        })
+    }
+    fn reap(&mut self, process: &[u8]) -> Result<()> {
+        // SAFETY: the batch is exclusively borrowed and process is live.
+        check(unsafe { sys::siphon_changes_reap(self.0.as_ptr(), slice(process)) })
+    }
+    fn charge(&mut self, process: &[u8], counters: &[(&[u8], u64)]) -> Result<()> {
+        let counters: Vec<_> = counters
+            .iter()
+            .map(|&(name, amount)| sys::CounterView {
+                name: slice(name),
+                amount,
+            })
+            .collect();
+        // SAFETY: the batch is exclusively borrowed. The library copies the live array and names.
+        check(unsafe {
+            sys::siphon_changes_charge(
+                self.0.as_ptr(),
+                slice(process),
+                counters.as_ptr(),
+                counters.len(),
+            )
+        })
     }
 }
 

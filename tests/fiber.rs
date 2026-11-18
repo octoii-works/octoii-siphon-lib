@@ -11,7 +11,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Builder, Changes, Ending, Error, Fiber, NameChange, Options, Outcome, Query, Range, Result,
-    Run, Runtime, Snapshot, Wait, process_path,
+    Run, Runtime, Signal, Snapshot, Wait, process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -223,6 +223,8 @@ impl Fiber for VolumeIds {
     fn run(&self, run: &mut Run<'_>, (): (), _: Option<()>) -> Result<Ending<(), Self::Output>> {
         let id = run.new_id()?;
         let deadline = run.time_ms() + 60_000;
+        let process = run.path().to_vec();
+        run.charge(&process, &[(b"phase-units", 4)])?;
         run.write(b"phase-id", id.as_bytes())?
             .seal(b"phase-id")?
             .expire(b"phase-id", Some(deadline))?;
@@ -245,6 +247,8 @@ fn a_phase_and_its_runtime_allocate_from_the_same_volume() {
     };
     let after = runtime.new_id().unwrap();
     assert!(before < id && id < after);
+    let record = snapshot.fiber(&path).unwrap().unwrap();
+    assert!(record.usage.contains(&(b"phase-units".to_vec(), 4)));
     assert_eq!(
         snapshot.read(b"phase-id").unwrap().as_deref(),
         Some(id.as_bytes())
@@ -364,8 +368,16 @@ fn a_waiting_process_preserves_its_stop_handler_result() {
     until(&runtime, |snapshot| {
         snapshot.read(b"stoppable").unwrap().is_some()
     });
+    let mut premature = Changes::new().unwrap();
+    premature.reap(&path).unwrap();
+    assert_eq!(runtime.commit(&premature).unwrap_err().code, 4);
+
     let mut changes = Changes::new().unwrap();
-    changes.terminate(&path).unwrap();
+    changes
+        .charge(&path, &[(b"units", 9)])
+        .unwrap()
+        .signal(&path, Signal::Terminate, Some(b"test stop"))
+        .unwrap();
     runtime.commit(&changes).unwrap();
 
     let stopped = finished(&runtime, &path);
@@ -373,12 +385,63 @@ fn a_waiting_process_preserves_its_stop_handler_result() {
         stopped.outcome::<Stoppable>(&path).unwrap(),
         Some(Outcome::Stopped {
             result: Some("partial output".into()),
-            reason: None
+            reason: Some(b"test stop".to_vec())
         })
     );
     assert_eq!(
         stopped.read(b"stoppable").unwrap(),
         Some(b"stopped".to_vec())
+    );
+    let record = stopped.fiber(&path).unwrap().unwrap();
+    assert!(record.usage.contains(&(b"units".to_vec(), 9)));
+
+    let mut reap = Changes::new().unwrap();
+    reap.reap(&path).unwrap();
+    runtime.commit(&reap).unwrap();
+    assert_eq!(runtime.snapshot().unwrap().fiber(&path).unwrap(), None);
+    assert_eq!(stopped.fiber(&path).unwrap(), Some(record));
+}
+
+#[test]
+fn graceful_removal_runs_stop_handlers_and_force_removal_kills_the_subtree() {
+    let mut builder = Builder::new().unwrap();
+    builder.fiber(Stoppable).unwrap();
+    let runtime = builder.memory().unwrap();
+    let start_group = |group: &[u8]| {
+        let mut changes = Changes::new().unwrap();
+        changes
+            .mkdir(group)
+            .unwrap()
+            .start::<Stoppable>(group, b"child", &"partial output".into())
+            .unwrap();
+        runtime.commit(&changes).unwrap();
+        until(&runtime, |snapshot| {
+            snapshot.read(b"stoppable").unwrap().as_deref() == Some(b"waiting")
+        });
+    };
+
+    start_group(b"graceful");
+    let mut graceful = Changes::new().unwrap();
+    graceful.remove(b"graceful", Some(b"cleanup")).unwrap();
+    runtime.commit(&graceful).unwrap();
+    let stopped = until(&runtime, |snapshot| {
+        snapshot.stat(b"graceful").unwrap().is_none()
+    });
+    assert_eq!(
+        stopped.read(b"stoppable").unwrap().as_deref(),
+        Some(b"stopped".as_slice())
+    );
+
+    start_group(b"forced");
+    let mut forced = Changes::new().unwrap();
+    forced.force_remove(b"forced", Some(b"discard")).unwrap();
+    runtime.commit(&forced).unwrap();
+    let stopped = until(&runtime, |snapshot| {
+        snapshot.stat(b"forced").unwrap().is_none()
+    });
+    assert_eq!(
+        stopped.read(b"stoppable").unwrap().as_deref(),
+        Some(b"waiting".as_slice())
     );
 }
 

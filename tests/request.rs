@@ -12,7 +12,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Answer, Asked, Builder, Changes, Ending, Error, Fiber, Options, Outcome, Request, Result, Run,
-    Runtime, Unanswered, Wait, process_path,
+    Runtime, Signal, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -268,7 +268,7 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     let process = start::<Once>(&runtime, b"stop", &42);
     assert_eq!(running.recv_timeout(TIMEOUT).unwrap(), process);
     let mut changes = Changes::new().unwrap();
-    changes.terminate(&process).unwrap();
+    changes.signal(&process, Signal::Terminate, None).unwrap();
     runtime.commit(&changes).unwrap();
     assert_eq!(
         finish::<Once>(&runtime, &process),

@@ -99,6 +99,10 @@ enum {
 };
 enum { SIPHON_WAIT_CHILD = 1, SIPHON_WAIT_CHANGE, SIPHON_WAIT_MAIL };
 enum { SIPHON_OUTCOME_PENDING = 0, SIPHON_OUTCOME_COMPLETED, SIPHON_OUTCOME_FAILED, SIPHON_OUTCOME_STOPPED };
+enum {
+    SIPHON_SIGNAL_HANGUP = 1, SIPHON_SIGNAL_INTERRUPT, SIPHON_SIGNAL_TERMINATE, SIPHON_SIGNAL_KILL,
+    SIPHON_SIGNAL_STOP, SIPHON_SIGNAL_CONTINUE
+};
 enum { SIPHON_ANSWER_GIVEN = 1, SIPHON_ANSWER_FAILED, SIPHON_ANSWER_INTERRUPTED };
 enum { SIPHON_REQUEST_STOP = 1, SIPHON_REQUEST_CLOSED };
 uint32_t siphon_abi_version(void);
@@ -153,7 +157,16 @@ siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
 siphon_status siphon_process_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
 siphon_status siphon_changes_start(siphon_changes *changes, siphon_slice parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
-siphon_status siphon_changes_terminate(siphon_changes *changes, siphon_slice process);
+/* Reasons are optional bytes. A null, zero-length slice omits the reason.
+ * Remove lets stop handlers run. Force remove kills live Fibers before discarding the subtree.
+ */
+siphon_status siphon_changes_signal(siphon_changes *changes, siphon_slice process, uint32_t signal, siphon_slice reason);
+siphon_status siphon_changes_remove(siphon_changes *changes, siphon_slice path, siphon_slice reason);
+siphon_status siphon_changes_force_remove(siphon_changes *changes, siphon_slice path, siphon_slice reason);
+siphon_status siphon_changes_reap(siphon_changes *changes, siphon_slice process);
+/* The batch copies the counter array and its names during the call. */
+siphon_status siphon_changes_charge(siphon_changes *changes, siphon_slice process,
+    const siphon_counter_view *counters, size_t len);
 siphon_status siphon_run_info(const siphon_run *run, siphon_slice *path, int64_t *time_ms, uint8_t *stop_handler);
 /* Allocates from the same volume inside the phase. Free the buffer with siphon_buffer_free. */
 siphon_status siphon_run_new_id(const siphon_run *run, siphon_buffer *out);

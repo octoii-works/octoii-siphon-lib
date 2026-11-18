@@ -249,7 +249,22 @@ unsafe extern "C" {
         version: u32,
         input: Slice,
     ) -> Status;
-    pub fn siphon_changes_terminate(changes: *mut Changes, process: Slice) -> Status;
+    pub fn siphon_changes_signal(
+        changes: *mut Changes,
+        process: Slice,
+        signal: u32,
+        reason: Slice,
+    ) -> Status;
+    pub fn siphon_changes_remove(changes: *mut Changes, path: Slice, reason: Slice) -> Status;
+    pub fn siphon_changes_force_remove(changes: *mut Changes, path: Slice, reason: Slice)
+    -> Status;
+    pub fn siphon_changes_reap(changes: *mut Changes, process: Slice) -> Status;
+    pub fn siphon_changes_charge(
+        changes: *mut Changes,
+        process: Slice,
+        counters: *const CounterView,
+        len: usize,
+    ) -> Status;
     pub fn siphon_process_path(parent: Slice, key: Slice, out: *mut Buffer) -> Status;
     pub fn siphon_snapshot_stat(
         snapshot: *const Snapshot,
