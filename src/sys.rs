@@ -106,6 +106,22 @@ pub struct SnapshotQuery {
     pub after: Slice,
     pub limit: usize,
 }
+#[repr(C)]
+pub struct ChangeSetView {
+    pub seq: u64,
+    pub paths: *const Slice,
+    pub paths_len: usize,
+}
+#[repr(C)]
+pub struct JournalView {
+    pub change_sets: *const ChangeSetView,
+    pub change_sets_len: usize,
+    pub through: u64,
+    pub oldest: *const u64,
+    pub latest: u64,
+    pub missed: u8,
+}
+type JournalVisitor = unsafe extern "C" fn(*mut c_void, *const JournalView);
 type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
 type FoundVisitor = unsafe extern "C" fn(*mut c_void, Slice, Slice, *const EntryView);
 
@@ -235,6 +251,13 @@ unsafe extern "C" {
         out: *mut Buffer,
     ) -> Status;
     pub fn siphon_snapshot_seq(snapshot: *const Snapshot, out: *mut u64) -> Status;
+    pub fn siphon_snapshot_journal(
+        snapshot: *const Snapshot,
+        after: u64,
+        limit: usize,
+        context: *mut c_void,
+        visit: Option<JournalVisitor>,
+    ) -> Status;
     pub fn siphon_snapshot_outcome(
         snapshot: *const Snapshot,
         process: Slice,

@@ -50,9 +50,23 @@ typedef struct {
     siphon_slice after;
     size_t limit;
 } siphon_snapshot_query;
+typedef struct {
+    uint64_t seq;
+    const siphon_slice *paths;
+    size_t paths_len;
+} siphon_change_set_view;
+typedef struct {
+    const siphon_change_set_view *change_sets;
+    size_t change_sets_len;
+    uint64_t through;
+    const uint64_t *oldest;
+    uint64_t latest;
+    uint8_t missed;
+} siphon_journal_view;
 typedef void (*siphon_entry_visitor)(void *context, const siphon_entry_view *entry);
 typedef void (*siphon_found_visitor)(void *context, siphon_slice path, siphon_slice value,
     const siphon_entry_view *entry);
+typedef void (*siphon_journal_visitor)(void *context, const siphon_journal_view *page);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
@@ -158,6 +172,13 @@ siphon_status siphon_snapshot_find(const siphon_snapshot *snapshot, siphon_snaps
     siphon_found_visitor visit);
 siphon_status siphon_snapshot_read(const siphon_snapshot *snapshot, siphon_slice path, uint64_t offset, uint64_t length, siphon_buffer *out);
 siphon_status siphon_snapshot_seq(const siphon_snapshot *snapshot, uint64_t *out);
+/* Read up to limit commits after the exclusive cursor. The visitor runs once on success, even for an
+ * empty result. The page, arrays and byte slices are borrowed until it returns. The visitor must
+ * not unwind or free the snapshot. Through advances over commits with no changed paths.
+ * Oldest is null if no history is retained. Missed means some commits after the cursor were pruned.
+ */
+siphon_status siphon_snapshot_journal(const siphon_snapshot *snapshot, uint64_t after, size_t limit,
+    void *context, siphon_journal_visitor visit);
 /* Missing process returns status 1; absent payloads and reasons are empty buffers. */
 siphon_status siphon_snapshot_outcome(const siphon_snapshot *snapshot, siphon_slice process, uint32_t *kind,
     siphon_buffer *payload, siphon_buffer *reason);

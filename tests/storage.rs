@@ -235,6 +235,68 @@ fn metadata_and_index_pages_follow_their_snapshot() {
 }
 
 #[test]
+fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
+    let mut runtime = Runtime::memory().unwrap();
+    let initial = runtime.snapshot().unwrap().journal(0, 1).unwrap();
+    assert!(initial.change_sets.is_empty());
+    assert_eq!(
+        (initial.through, initial.oldest, initial.latest),
+        (0, None, 0)
+    );
+    assert!(!initial.missed);
+
+    let mut write = Changes::new().unwrap();
+    write.write(b"raw\xff", b"one").unwrap();
+    let first = runtime.commit(&write).unwrap();
+    let retained = runtime.snapshot().unwrap();
+    let empty = runtime.commit(&Changes::new().unwrap()).unwrap();
+    assert!(empty > first);
+
+    let mut rewrite = Changes::new().unwrap();
+    rewrite
+        .delete(b"raw\xff")
+        .unwrap()
+        .write(b"new", b"two")
+        .unwrap();
+    let last = runtime.commit(&rewrite).unwrap();
+    let snapshot = runtime.snapshot().unwrap();
+    runtime.close().unwrap();
+
+    let page = snapshot.journal(0, 1).unwrap();
+    assert_eq!(
+        (page.through, page.oldest, page.latest),
+        (first, Some(first), last)
+    );
+    assert!(!page.missed);
+    assert_eq!(page.change_sets.len(), 1);
+    assert_eq!(page.change_sets[0].seq, first);
+    assert_eq!(page.change_sets[0].paths, [b"raw\xff".to_vec()]);
+
+    let quiet = snapshot.journal(page.through, 1).unwrap();
+    assert!(quiet.change_sets.is_empty());
+    assert_eq!(quiet.through, empty);
+    assert!(!quiet.missed);
+
+    let next = snapshot.journal(quiet.through, 1).unwrap();
+    assert_eq!(next.through, last);
+    assert_eq!(next.change_sets.len(), 1);
+    assert_eq!(next.change_sets[0].seq, last);
+    assert_eq!(next.change_sets[0].paths.len(), 2);
+    assert!(
+        next.change_sets[0]
+            .paths
+            .iter()
+            .any(|path| path == b"raw\xff")
+    );
+    assert!(next.change_sets[0].paths.iter().any(|path| path == b"new"));
+    assert!(snapshot.journal(last, 1).unwrap().change_sets.is_empty());
+
+    let old = retained.journal(0, 10).unwrap();
+    assert_eq!((old.through, old.latest), (first, first));
+    assert_eq!(old.change_sets, page.change_sets);
+}
+
+#[test]
 fn a_failed_batch_does_not_commit_earlier_writes() {
     let runtime = Runtime::memory().unwrap();
     let mut batch = Changes::new().unwrap();

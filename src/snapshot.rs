@@ -71,6 +71,27 @@ pub struct Found {
     pub entry: Entry,
 }
 
+/// The paths changed in a single commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub seq: u64,
+    pub paths: Vec<Vec<u8>>,
+}
+
+/// An owned page of the volume journal read through a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Journal {
+    pub change_sets: Vec<ChangeSet>,
+    /// The cursor after the commits read. Empty commits can advance this cursor.
+    pub through: u64,
+    /// The oldest sequence the volume retains at the time of the read.
+    pub oldest: Option<u64>,
+    /// The sequence of the snapshot.
+    pub latest: u64,
+    /// Some commits after the cursor are no longer retained.
+    pub missed: bool,
+}
+
 #[derive(Debug)]
 pub struct Snapshot(pub(crate) SnapshotHandle);
 // SAFETY: native snapshots are immutable and support concurrent reads.
@@ -91,6 +112,11 @@ impl Snapshot {
     /// Finds indexed directories in full byte path order, up to the limit.
     pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
         self.0.find(query, limit)
+    }
+
+    /// Reads at most limit commits strictly after the cursor.
+    pub fn journal(&self, after: u64, limit: usize) -> Result<Journal> {
+        self.0.journal(after, limit)
     }
 
     pub fn sequence(&self) -> Result<u64> {
@@ -182,6 +208,24 @@ impl SnapshotHandle {
         Ok(matches)
     }
 
+    fn journal(&self, after: u64, limit: usize) -> Result<Journal> {
+        let mut page = None;
+        // SAFETY: the snapshot is live. The synchronous visitor writes into page exclusively.
+        check(unsafe {
+            sys::siphon_snapshot_journal(
+                self.0.as_ptr(),
+                after,
+                limit,
+                ptr::from_mut(&mut page).cast(),
+                Some(collect_journal),
+            )
+        })?;
+        page.ok_or_else(|| Error {
+            code: 4,
+            message: "Siphon returned no page for a successful journal read".into(),
+        })
+    }
+
     pub(crate) fn sequence(&self) -> Result<u64> {
         let mut seq = 0;
         // SAFETY: live snapshot and writable output.
@@ -245,13 +289,19 @@ impl SnapshotHandle {
     }
 }
 
+/// Safety: a nonempty array must be readable for the returned borrow.
+unsafe fn borrow_array<'a, T>(data: *const T, len: usize) -> &'a [T] {
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: the native library keeps nonempty arrays readable for the visit.
+    unsafe { std::slice::from_raw_parts(data, len) }
+}
+
 /// Safety: the native metadata view and its bytes must be valid for this visit.
 unsafe fn copy_named(values: &sys::NamedSlice) -> Vec<(Vec<u8>, Vec<u8>)> {
-    if values.len == 0 {
-        return Vec::new();
-    }
     // SAFETY: the native library keeps the array and all of its byte slices live for the visit.
-    unsafe { std::slice::from_raw_parts(values.data, values.len) }
+    unsafe { borrow_array(values.data, values.len) }
         .iter()
         .map(|item| {
             // SAFETY: both byte slices belong to this live metadata array.
@@ -302,6 +352,34 @@ unsafe extern "C" fn collect_found(
             value: borrow_slice(value).to_vec(),
             entry: copy_entry(&*view),
         }
+    });
+}
+
+unsafe extern "C" fn collect_journal(context: *mut c_void, view: *const sys::JournalView) {
+    // SAFETY: the wrapper passes a live output slot and the library supplies a borrowed page.
+    let (page, view) = unsafe { (&mut *context.cast::<Option<Journal>>(), &*view) };
+    // SAFETY: the native page owns all the change set views for this visit.
+    let change_sets = unsafe { borrow_array(view.change_sets, view.change_sets_len) }
+        .iter()
+        .map(|set| {
+            // SAFETY: the path array and its byte slices remain readable through this visit.
+            let paths = unsafe { borrow_array(set.paths, set.paths_len) }
+                .iter()
+                .map(|path| unsafe { borrow_slice(*path) }.to_vec())
+                .collect();
+            ChangeSet {
+                seq: set.seq,
+                paths,
+            }
+        })
+        .collect();
+    *page = Some(Journal {
+        change_sets,
+        through: view.through,
+        // SAFETY: oldest is null or points into the live journal page.
+        oldest: unsafe { view.oldest.as_ref().copied() },
+        latest: view.latest,
+        missed: view.missed != 0,
     });
 }
 

@@ -19,7 +19,7 @@ use std::{
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use request::{Answer, Asked, Request, Unanswered};
 use snapshot::SnapshotHandle;
-pub use snapshot::{Directory, Entry, Found, Query, Range, Snapshot};
+pub use snapshot::{ChangeSet, Directory, Entry, Found, Journal, Query, Range, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
