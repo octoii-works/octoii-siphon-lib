@@ -14,7 +14,7 @@ use crate::{
     compatible, discard_panic, handle, panic_message, present, release_context, slice, sys, take,
 };
 
-/// Programs and request handlers to register before opening a runtime.
+/// Fibers and request handlers to register before opening a runtime.
 #[derive(Debug)]
 pub struct Builder(pub(crate) NonNull<sys::Builder>);
 
@@ -27,9 +27,9 @@ impl Builder {
         Ok(Self(handle(out)?))
     }
 
-    /// Registers `program`. A rejected registration drops its program before returning.
-    pub fn program<P: Program>(&mut self, program: P) -> Result<&mut Self> {
-        let context = Box::into_raw(Box::new(program)).cast();
+    /// Registers `fiber`. A rejected registration drops its fiber before returning.
+    pub fn fiber<P: Fiber>(&mut self, fiber: P) -> Result<&mut Self> {
+        let context = Box::into_raw(Box::new(fiber)).cast();
         let Options {
             stop_handler,
             retries,
@@ -37,7 +37,7 @@ impl Builder {
         // SAFETY: builder is exclusively borrowed, kind is static, and the native library takes
         // ownership of context on all paths and keeps it alive until release_context is called.
         check(unsafe {
-            sys::siphon_builder_program(
+            sys::siphon_builder_fiber(
                 self.0.as_ptr(),
                 slice(P::KIND.as_bytes()),
                 P::VERSION,
@@ -46,14 +46,14 @@ impl Builder {
                 retries.delay_min_ms,
                 retries.delay_max_ms,
                 context,
-                Some(run_program::<P>),
+                Some(run_fiber::<P>),
                 Some(release_context::<P>),
             )
         })?;
         Ok(self)
     }
 
-    /// Opens persistent storage, consuming the builder and its registrations. Programs can run
+    /// Opens persistent storage, consuming the builder and its registrations. Fibers can run
     /// resumed processes before this call returns.
     pub fn open(self, directory: &Path) -> Result<Runtime> {
         let directory = directory
@@ -104,7 +104,7 @@ impl Retries {
     };
 }
 
-/// Runtime options for processes of a registered program.
+/// Runtime options for processes of a registered fiber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     pub stop_handler: bool,
@@ -125,7 +125,7 @@ impl Default for Options {
 }
 
 /// The code processes of one kind run, one synchronous phase at a time.
-pub trait Program: Send + Sync + 'static {
+pub trait Fiber: Send + Sync + 'static {
     const KIND: &'static str;
     const VERSION: u32 = 1;
     const OPTIONS: Options = Options::DEFAULT;
@@ -263,7 +263,7 @@ impl<'a> Run<'a> {
         self.snapshot.read_range(path, offset, length)
     }
 
-    pub fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         self.snapshot.outcome::<P>(process)
     }
 
@@ -350,7 +350,7 @@ impl<'a> Run<'a> {
         Ok(self)
     }
 
-    pub fn start<P: Program>(
+    pub fn start<P: Fiber>(
         &mut self,
         parent: &[u8],
         key: &[u8],
@@ -366,7 +366,7 @@ impl<'a> Run<'a> {
     }
 }
 
-unsafe extern "C" fn run_program<P: Program>(
+unsafe extern "C" fn run_fiber<P: Fiber>(
     context: *mut c_void,
     run: *mut sys::Run,
     input: sys::Slice,
@@ -374,7 +374,7 @@ unsafe extern "C" fn run_program<P: Program>(
 ) {
     let executed = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: registration keeps context and callback data alive until this call returns.
-        let program = unsafe { &*context.cast::<P>() };
+        let fiber = unsafe { &*context.cast::<P>() };
         let (input, checkpoint) = unsafe { (borrow_slice(input), borrow_slice(checkpoint)) };
         let input = from_slice(input)?;
         let checkpoint = (!checkpoint.is_empty())
@@ -383,7 +383,7 @@ unsafe extern "C" fn run_program<P: Program>(
         let mut phase = handle(run)?;
         // SAFETY: this is the unique live callback handle for this invocation.
         let mut scoped = unsafe { Run::new(&mut phase)? };
-        let ending = program.run(&mut scoped, input, checkpoint)?;
+        let ending = fiber.run(&mut scoped, input, checkpoint)?;
         finish(run, ending)
     }));
     match executed {
@@ -435,7 +435,7 @@ fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) 
             output.as_ref().map(to_vec).transpose()?.unwrap_or_default(),
         ),
     };
-    // Serialize and drop program-owned values before publishing the ending, as either can panic.
+    // Serialize and drop fiber-owned values before publishing the ending, as either can panic.
     end(run, kind, &payload)
 }
 

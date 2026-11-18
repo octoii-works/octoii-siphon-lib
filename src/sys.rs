@@ -102,7 +102,7 @@ unsafe extern "C" {
     pub fn siphon_buffer_free(buffer: Buffer);
     pub fn siphon_builder_new(out: *mut *mut Builder) -> Status;
     pub fn siphon_builder_free(builder: *mut Builder);
-    pub fn siphon_builder_program(
+    pub fn siphon_builder_fiber(
         builder: *mut Builder,
         kind: Slice,
         version: u32,

@@ -10,8 +10,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Builder, Changes, Ending, Error, Options, Outcome, Program, Result, Run, Runtime, Snapshot,
-    Wait, process_path,
+    Builder, Changes, Ending, Error, Fiber, Options, Outcome, Result, Run, Runtime, Snapshot, Wait,
+    process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,13 +28,13 @@ fn until(runtime: &Runtime, ready: impl Fn(&Snapshot) -> bool) -> Snapshot {
     }
 }
 
-fn finished<P: Program>(runtime: &Runtime, path: &[u8]) -> Snapshot {
+fn finished<P: Fiber>(runtime: &Runtime, path: &[u8]) -> Snapshot {
     until(runtime, |snapshot| {
         !matches!(snapshot.outcome::<P>(path).unwrap(), Some(Outcome::Pending))
     })
 }
 
-fn start<P: Program>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8> {
+fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8> {
     let mut changes = Changes::new().unwrap();
     changes.start::<P>(b"", key, input).unwrap();
     runtime.commit(&changes).unwrap();
@@ -43,7 +43,7 @@ fn start<P: Program>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8>
 
 struct Parent;
 
-impl Program for Parent {
+impl Fiber for Parent {
     const KIND: &'static str = "contract.parent";
     const VERSION: u32 = 2;
     type Input = (String, u32);
@@ -101,7 +101,7 @@ impl Program for Parent {
 
 struct Child;
 
-impl Program for Child {
+impl Fiber for Child {
     const KIND: &'static str = "contract.child";
     type Input = u32;
     type Checkpoint = ();
@@ -116,7 +116,7 @@ impl Program for Child {
 fn checkpoints_waits_and_phase_writes_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let mut builder = Builder::new().unwrap();
-    builder.program(Parent).unwrap().program(Child).unwrap();
+    builder.fiber(Parent).unwrap().fiber(Child).unwrap();
     let mut runtime = builder.open(directory.path()).unwrap();
     let path = process_path(b"", b"parent").unwrap();
     assert_eq!(
@@ -161,7 +161,7 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
 
 struct Stoppable;
 
-impl Program for Stoppable {
+impl Fiber for Stoppable {
     const KIND: &'static str = "contract.stoppable";
     const OPTIONS: Options = Options {
         stop_handler: true,
@@ -194,7 +194,7 @@ impl Program for Stoppable {
 #[test]
 fn a_waiting_process_preserves_its_stop_handler_result() {
     let mut builder = Builder::new().unwrap();
-    builder.program(Stoppable).unwrap();
+    builder.fiber(Stoppable).unwrap();
     let runtime = builder.memory().unwrap();
     let path = start::<Stoppable>(&runtime, b"stop", &"partial output".into());
     until(&runtime, |snapshot| {
@@ -228,7 +228,7 @@ impl Drop for PanicOnDrop {
 
 struct Fails;
 
-impl Program for Fails {
+impl Fiber for Fails {
     const KIND: &'static str = "contract.failure";
     type Input = String;
     type Checkpoint = ();
@@ -251,7 +251,7 @@ impl Program for Fails {
 #[test]
 fn explicit_failure_commits_writes_while_errors_and_panics_discard_them() {
     let mut builder = Builder::new().unwrap();
-    builder.program(Fails).unwrap();
+    builder.fiber(Fails).unwrap();
     let runtime = builder.memory().unwrap();
     for (kind, message, file) in [
         ("fail", "explicit failure", Some(b"staged".to_vec())),
@@ -274,7 +274,7 @@ fn explicit_failure_commits_writes_while_errors_and_panics_discard_them() {
 
 struct Tracked(Arc<AtomicUsize>);
 
-impl Program for Tracked {
+impl Fiber for Tracked {
     const KIND: &'static str = "contract.tracked";
     type Input = ();
     type Checkpoint = ();
@@ -296,9 +296,9 @@ fn registration_ownership_covers_rejection_failed_open_and_close() {
     let releases = Arc::new(AtomicUsize::new(0));
     let count = || releases.load(Ordering::SeqCst);
     let mut builder = Builder::new().unwrap();
-    builder.program(Tracked(releases.clone())).unwrap();
+    builder.fiber(Tracked(releases.clone())).unwrap();
     assert_eq!(
-        builder.program(Tracked(releases.clone())).unwrap_err().code,
+        builder.fiber(Tracked(releases.clone())).unwrap_err().code,
         2
     );
     assert_eq!(count(), 1);
@@ -308,12 +308,12 @@ fn registration_ownership_covers_rejection_failed_open_and_close() {
     let directory = tempfile::tempdir().unwrap();
     let _locked = Runtime::open(directory.path()).unwrap();
     let mut builder = Builder::new().unwrap();
-    builder.program(Tracked(releases.clone())).unwrap();
+    builder.fiber(Tracked(releases.clone())).unwrap();
     assert!(builder.open(directory.path()).is_err());
     assert_eq!(count(), 3);
 
     let mut builder = Builder::new().unwrap();
-    builder.program(Tracked(releases.clone())).unwrap();
+    builder.fiber(Tracked(releases.clone())).unwrap();
     let mut runtime = builder.memory().unwrap();
     assert_eq!(count(), 3);
     runtime.close().unwrap();
@@ -328,7 +328,7 @@ struct CallbackOwner {
     released: mpsc::Sender<u32>,
 }
 
-impl Program for CallbackOwner {
+impl Fiber for CallbackOwner {
     const KIND: &'static str = "contract.reentry";
     type Input = ();
     type Checkpoint = ();
@@ -361,7 +361,7 @@ fn callbacks_reject_blocking_calls_and_can_drop_the_last_runtime_owner() {
     let slot = Arc::new(Mutex::new(None));
     let mut builder = Builder::new().unwrap();
     builder
-        .program(CallbackOwner {
+        .fiber(CallbackOwner {
             runtime: slot.clone(),
             report,
             released,

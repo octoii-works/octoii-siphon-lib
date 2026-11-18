@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 3 is experimental until a release. All handles are opaque.
+/* ABI 4 is experimental until a release. All handles are opaque.
  * Slices are borrowed for a call. Returned buffers must be freed by this library.
  * Never free or mutate handles concurrently with their use.
  * Runtime calls serialize internally. Snapshot reads are thread-safe.
@@ -49,7 +49,7 @@ void siphon_builder_free(siphon_builder *builder);
  * Input and checkpoints are JSON; an empty checkpoint means none. Borrowed phase values are local
  * to the callback thread and valid only until the callback returns.
  */
-siphon_status siphon_builder_program(siphon_builder *builder, siphon_slice kind, uint32_t version, uint8_t stop_handler,
+siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, uint32_t version, uint8_t stop_handler,
     uint32_t retries, int64_t delay_min_ms, int64_t delay_max_ms, void *context, siphon_phase_callback run, siphon_release_callback release);
 /* With release, context transfers even on registration error. Keep context ready before open and
  * thread-safe for concurrent deliveries. Copy the borrowed slices and transfer reply to host work.

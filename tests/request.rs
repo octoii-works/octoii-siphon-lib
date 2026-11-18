@@ -11,8 +11,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Answer, Asked, Builder, Changes, Ending, Error, Options, Outcome, Program, Request, Result,
-    Run, Runtime, Unanswered, Wait, process_path,
+    Answer, Asked, Builder, Changes, Ending, Error, Fiber, Options, Outcome, Request, Result, Run,
+    Runtime, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,14 +26,14 @@ fn host() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn start<P: Program>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8> {
+fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8> {
     let mut changes = Changes::new().unwrap();
     changes.start::<P>(b"", key, input).unwrap();
     runtime.commit(&changes).unwrap();
     process_path(b"", key).unwrap()
 }
 
-fn finish<P: Program>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
+fn finish<P: Fiber>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let outcome = runtime.snapshot().unwrap().outcome::<P>(process).unwrap();
@@ -70,7 +70,7 @@ enum Turn {
     },
 }
 
-impl Program for Twice {
+impl Fiber for Twice {
     const KIND: &'static str = "contract.requests";
     type Input = u32;
     type Checkpoint = Turn;
@@ -130,7 +130,7 @@ impl Program for Twice {
 
 struct Throws;
 
-impl Program for Throws {
+impl Fiber for Throws {
     const KIND: &'static str = "contract.throwing-request";
     type Input = ();
     type Checkpoint = ();
@@ -152,9 +152,9 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
     let (deliveries, received) = mpsc::channel();
     let mut builder = Builder::new().unwrap();
     builder
-        .program(Throws)
+        .fiber(Throws)
         .unwrap()
-        .program(Twice)
+        .fiber(Twice)
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             assert_eq!(thread::current().name(), Some("siphon-request-host"));
@@ -214,7 +214,7 @@ impl From<Answer<u32>> for Response {
     }
 }
 
-impl Program for Once {
+impl Fiber for Once {
     const KIND: &'static str = "contract.one-request";
     const OPTIONS: Options = Options {
         stop_handler: true,
@@ -253,7 +253,7 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     let (started, running) = mpsc::channel();
     let mut builder = Builder::new().unwrap();
     builder
-        .program(Once)
+        .fiber(Once)
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             let started = started.clone();
@@ -297,7 +297,7 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     let blocked = Mutex::new(Some(blocked));
     let mut builder = Builder::new().unwrap();
     builder
-        .program(Once)
+        .fiber(Once)
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |_| {
             let blocked = blocked.lock().unwrap().take().unwrap();
@@ -329,7 +329,7 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     let mut builder = Builder::new().unwrap();
     let seen = deliveries.clone();
     builder
-        .program(Once)
+        .fiber(Once)
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |_| {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -359,7 +359,7 @@ fn host_handler_panics_become_failed_answers() {
     let executor = host();
     let mut builder = Builder::new().unwrap();
     builder
-        .program(Once)
+        .fiber(Once)
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), |asked| {
             assert!(asked.payload.0 != 0, "constructing the handler");

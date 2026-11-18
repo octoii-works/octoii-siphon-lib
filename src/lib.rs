@@ -1,8 +1,8 @@
 //! Safe Rust interface to a separately built Siphon binary.
-//! Register programs on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
-//! Register handlers on a host executor to answer typed [`Request`]s from programs.
+//! Register fibers on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
+//! Register handlers on a host executor to answer typed [`Request`]s from fibers.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
-mod program;
+mod fiber;
 mod request;
 mod sys;
 
@@ -15,7 +15,7 @@ use std::{
     ptr::NonNull,
 };
 
-pub use program::{Builder, Ending, Options, Outcome, Program, Retries, Run, Wait};
+pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use request::{Answer, Asked, Request, Unanswered};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +103,7 @@ fn check(status: sys::Status) -> Result<()> {
 }
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
-    if unsafe { sys::siphon_abi_version() } == 3 {
+    if unsafe { sys::siphon_abi_version() } == 4 {
         Ok(())
     } else {
         Err(Error {
@@ -199,7 +199,7 @@ impl Changes {
         Ok(self)
     }
     /// Stages a process start in this batch. An empty parent denotes the root.
-    pub fn start<P: Program>(
+    pub fn start<P: Fiber>(
         &mut self,
         parent: &[u8],
         key: &[u8],
@@ -242,7 +242,7 @@ impl ChangeHandle {
         // SAFETY: batch is exclusively borrowed, path lives for the call.
         check(unsafe { sys::siphon_changes_delete(self.0.as_ptr(), slice(path)) })
     }
-    fn start<P: Program>(&mut self, parent: &[u8], key: &[u8], input: &P::Input) -> Result<()> {
+    fn start<P: Fiber>(&mut self, parent: &[u8], key: &[u8], input: &P::Input) -> Result<()> {
         let input = serde_json::to_vec(input)?;
         // SAFETY: batch is exclusively borrowed, slices live for the call.
         check(unsafe {
@@ -279,7 +279,7 @@ impl Snapshot {
         self.0.read_range(path, offset, length)
     }
     /// Reads the outcome at `process`, returning `None` when the path has no process record.
-    pub fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         self.0.outcome::<P>(process)
     }
 }
@@ -310,7 +310,7 @@ impl SnapshotHandle {
         let data = take(out);
         Ok(present(status)?.then_some(data))
     }
-    fn outcome<P: Program>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+    fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         let mut kind = sys::OUTCOME_PENDING;
         let mut payload = sys::Buffer::default();
         let mut reason = sys::Buffer::default();

@@ -4,7 +4,7 @@ Public Rust interface and binary distribution for Siphon.
 
 ## Status
 
-Development preview. The current slice implements atomic storage changes, retained snapshots, program
+Development preview. The current slice implements atomic storage changes, retained snapshots, fiber
 execution, asynchronous host request handlers, shutdown and persistent reopening. Streaming, machine
 operations and processing libraries are still being adapted.
 
@@ -17,7 +17,7 @@ consumer-side C compiler is needed. No Rust ABI, runtime object or allocator own
 Set `SIPHON_LIB_DIR` to a prebuilt artifact directory containing `libsiphon_native.a` and `manifest.json`:
 
 ```json
-{"abi": 3, "target": "aarch64-apple-darwin", "sha256": "<SHA-256 of the archive>"}
+{"abi": 4, "target": "aarch64-apple-darwin", "sha256": "<SHA-256 of the archive>"}
 ```
 
 ```sh
@@ -46,14 +46,14 @@ stops execution and waits for shutdown. Snapshots remain readable after close, b
 drop them before reopening the same directory. Drop closes an unclosed runtime; explicit `close` can
 report shutdown errors. Paths inside the volume are bytes; the storage directory currently requires UTF-8.
 
-## Running a program
+## Running a fiber
 
 ```rust,no_run
-use octoii_siphon_lib::{Builder, Changes, Ending, Program, Result, Run, process_path};
+use octoii_siphon_lib::{Builder, Changes, Ending, Fiber, Result, Run, process_path};
 
 struct WriteMessage;
 
-impl Program for WriteMessage {
+impl Fiber for WriteMessage {
     const KIND: &'static str = "example.write-message";
     type Input = String;
     type Checkpoint = ();
@@ -66,7 +66,7 @@ impl Program for WriteMessage {
 }
 
 let mut builder = Builder::new()?;
-builder.program(WriteMessage)?;
+builder.fiber(WriteMessage)?;
 let runtime = builder.memory()?;
 let mut changes = Changes::new()?;
 changes.start::<WriteMessage>(b"", b"example", &"hello".to_owned())?;
@@ -79,11 +79,11 @@ let outcome = runtime.snapshot()?.outcome::<WriteMessage>(&process)?;
 The Rust adapter stores typed input, checkpoints and output as JSON. A phase reads its snapshot
 and stages changes through `Run`. The runtime commits its ending and changes together. `Ending::Fail`
 records a failure with those changes. A returned error or caught panic discards the staged changes
-and follows the program's retry policy. An existing process awaiting an outcome is `Outcome::Pending`.
+and follows the fiber's retry policy. An existing process awaiting an outcome is `Outcome::Pending`.
 
-Initialize the program before registering it. A persisted process can resume during `Builder::open`,
+Initialize the fiber before registering it. A persisted process can resume during `Builder::open`,
 before the caller receives the runtime. Blocking runtime calls return status 6 from phase callbacks
-and program destructors. Dropping the last runtime owner there starts shutdown, which finishes once
+and fiber destructors. Dropping the last runtime owner there starts shutdown, which finishes once
 the callback returns.
 
 ## Handling a request
@@ -95,7 +95,7 @@ request before `Builder::open` returns.
 
 ```rust,no_run
 use octoii_siphon_lib::{
-    Answer, Asked, Builder, Ending, Program, Request, Result, Run, Runtime, Wait,
+    Answer, Asked, Builder, Ending, Fiber, Request, Result, Run, Runtime, Wait,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -110,7 +110,7 @@ impl Request for Measure {
 
 struct MeasureMessage;
 
-impl Program for MeasureMessage {
+impl Fiber for MeasureMessage {
     const KIND: &'static str = "example.measure-message";
     type Input = String;
     type Checkpoint = String;
@@ -140,7 +140,7 @@ impl Program for MeasureMessage {
 
 fn open(executor: &Handle) -> Result<Runtime> {
     let mut builder = Builder::new()?;
-    builder.program(MeasureMessage)?;
+    builder.fiber(MeasureMessage)?;
     builder.handle(executor, |asked: Asked<Measure>| async move {
         Ok(asked.payload.0.len())
     })?;
