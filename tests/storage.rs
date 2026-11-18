@@ -1,4 +1,4 @@
-use octoii_siphon_lib::{Changes, Runtime};
+use octoii_siphon_lib::{Changes, Range, Runtime};
 
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
@@ -32,6 +32,94 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
         reopened.snapshot().unwrap().read(b"file").unwrap(),
         Some(b"two".to_vec())
     );
+}
+
+#[test]
+fn directory_pages_and_entries_are_owned_after_runtime_close() {
+    let mut runtime = Runtime::memory().unwrap();
+    let mut changes = Changes::new().unwrap();
+    changes
+        .mkdir(b"data")
+        .unwrap()
+        .mkdir(b"data/empty")
+        .unwrap()
+        .write(b"data/p-b", b"other")
+        .unwrap()
+        .write(b"data/p-a", b"")
+        .unwrap()
+        .write(b"data/p\xff", b"raw")
+        .unwrap();
+    let seq = runtime.commit(&changes).unwrap();
+    let snapshot = runtime.snapshot().unwrap();
+    runtime.close().unwrap();
+
+    let range = Range {
+        prefix: b"p",
+        limit: 2,
+        ..Range::default()
+    };
+    let forward = snapshot.list(b"data", &range).unwrap().unwrap();
+    assert_eq!(forward.len(), 2);
+    assert_eq!(forward[0].name, b"p-a");
+    assert_eq!(forward[0].length, 0);
+    assert_eq!(forward[1].name, b"p-b");
+    let next = snapshot
+        .list(
+            b"data",
+            &Range {
+                after: Some(&forward[1].name),
+                ..range
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].name, b"p\xff");
+
+    let reverse = snapshot
+        .list(
+            b"data",
+            &Range {
+                reverse: true,
+                ..range
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(reverse.len(), 2);
+    assert_eq!(reverse[0].name, b"p\xff");
+    assert_eq!(reverse[1].name, b"p-b");
+    let earlier = snapshot
+        .list(
+            b"data",
+            &Range {
+                reverse: true,
+                after: Some(&reverse[1].name),
+                ..range
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(earlier[0].name, b"p-a");
+
+    assert_eq!(
+        snapshot.list(b"data/empty", &range).unwrap(),
+        Some(Vec::new())
+    );
+    assert_eq!(snapshot.list(b"missing", &range).unwrap(), None);
+    assert!(snapshot.list(b"data/p-a", &range).is_err());
+    assert_eq!(snapshot.stat(b"missing").unwrap(), None);
+    let file = snapshot.stat(b"data/p\xff").unwrap().unwrap();
+    let directory = snapshot.stat(b"data").unwrap().unwrap().directory.unwrap();
+    drop(snapshot);
+
+    assert_eq!(file, next[0]);
+    assert_eq!(file.length, 3);
+    assert_eq!(file.expires_at, None);
+    assert_eq!(file.directory, None);
+    assert_eq!(directory.created_seq, seq);
+    assert!(directory.labels.is_empty() && directory.annotations.is_empty());
 }
 
 #[test]

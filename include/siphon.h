@@ -22,6 +22,27 @@ typedef struct siphon_reply siphon_reply;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
+typedef struct { siphon_slice name; siphon_slice value; } siphon_named_bytes;
+typedef struct { const siphon_named_bytes *data; size_t len; } siphon_named_slice;
+typedef struct {
+    siphon_named_slice labels;
+    siphon_named_slice annotations;
+    uint64_t created_seq;
+    uint64_t changed_seq;
+} siphon_directory_view;
+typedef struct {
+    siphon_slice name;
+    uint64_t length;
+    const int64_t *expires_at;
+    const siphon_directory_view *directory;
+} siphon_entry_view;
+typedef struct {
+    siphon_slice prefix;
+    siphon_slice after;
+    size_t limit;
+    uint8_t reverse;
+} siphon_snapshot_range;
+typedef void (*siphon_entry_visitor)(void *context, const siphon_entry_view *entry);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
@@ -102,6 +123,17 @@ void siphon_reply_free(siphon_reply *reply);
  * Empty payload is allowed for a missing checkpoint or stopped result. No ending means a throw.
  */
 siphon_status siphon_run_end(siphon_run *run, uint32_t kind, siphon_slice payload);
+/* The visitor runs synchronously on the calling thread. The entry and its fields are borrowed until
+ * it returns. The visitor must not unwind or free the snapshot. Directory is null for a file;
+ * expires_at is null or a time in milliseconds since the Unix epoch. Names and metadata are bytes.
+ * Both calls return status 1 for a missing path. An empty page succeeds with no visits.
+ * List selects byte names with prefix in ascending order (descending for nonzero reverse), up to
+ * limit entries. A null, zero-length after slice starts at the beginning; any other cursor is exclusive.
+ */
+siphon_status siphon_snapshot_stat(const siphon_snapshot *snapshot, siphon_slice path, void *context,
+    siphon_entry_visitor visit);
+siphon_status siphon_snapshot_list(const siphon_snapshot *snapshot, siphon_slice path, siphon_snapshot_range range,
+    void *context, siphon_entry_visitor visit);
 siphon_status siphon_snapshot_read(const siphon_snapshot *snapshot, siphon_slice path, uint64_t offset, uint64_t length, siphon_buffer *out);
 siphon_status siphon_snapshot_seq(const siphon_snapshot *snapshot, uint64_t *out);
 /* Missing process returns status 1; absent payloads and reasons are empty buffers. */

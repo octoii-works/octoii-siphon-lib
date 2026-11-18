@@ -10,8 +10,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Builder, Changes, Ending, Error, Fiber, Options, Outcome, Result, Run, Runtime, Snapshot, Wait,
-    process_path,
+    Builder, Changes, Ending, Error, Fiber, Options, Outcome, Range, Result, Run, Runtime,
+    Snapshot, Wait, process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +66,23 @@ impl Fiber for Parent {
                 Ok(Ending::Next(start))
             }
             Some(value) if value == start => {
+                let entry = run.stat(b"log")?.expect("the previous phase wrote log");
+                assert_eq!(entry.length, 4);
+                assert!(entry.directory.is_none());
+                let own = run.stat(run.path())?.unwrap().directory.unwrap();
+                assert!(
+                    own.labels
+                        .iter()
+                        .any(|(_, value)| value == Self::KIND.as_bytes())
+                );
+                let page = run.list(
+                    b"gate",
+                    &Range {
+                        limit: 1,
+                        ..Range::default()
+                    },
+                )?;
+                assert_eq!(page, Some(Vec::new()));
                 assert_eq!(run.read_range(b"log", 1, 2)?, Some(b"ex".to_vec()));
                 run.append(b"log", b" change")?;
                 Ok(Ending::Wait(value + 1, Wait::new().change(b"gate")))

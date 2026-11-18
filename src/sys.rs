@@ -26,6 +26,7 @@ pub struct Reply {
     _private: [u8; 0],
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Slice {
     pub data: *const u8,
     pub len: usize,
@@ -56,6 +57,39 @@ pub struct Status {
     pub code: u32,
     pub error: Buffer,
 }
+
+#[repr(C)]
+pub struct NamedBytes {
+    pub name: Slice,
+    pub value: Slice,
+}
+#[repr(C)]
+pub struct NamedSlice {
+    pub data: *const NamedBytes,
+    pub len: usize,
+}
+#[repr(C)]
+pub struct DirectoryView {
+    pub labels: NamedSlice,
+    pub annotations: NamedSlice,
+    pub created_seq: u64,
+    pub changed_seq: u64,
+}
+#[repr(C)]
+pub struct EntryView {
+    pub name: Slice,
+    pub length: u64,
+    pub expires_at: *const i64,
+    pub directory: *const DirectoryView,
+}
+#[repr(C)]
+pub struct SnapshotRange {
+    pub prefix: Slice,
+    pub after: Slice,
+    pub limit: usize,
+    pub reverse: u8,
+}
+type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
 
 #[repr(C)]
 pub struct Watch {
@@ -150,6 +184,19 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_changes_terminate(changes: *mut Changes, process: Slice) -> Status;
     pub fn siphon_process_path(parent: Slice, key: Slice, out: *mut Buffer) -> Status;
+    pub fn siphon_snapshot_stat(
+        snapshot: *const Snapshot,
+        path: Slice,
+        context: *mut c_void,
+        visit: Option<EntryVisitor>,
+    ) -> Status;
+    pub fn siphon_snapshot_list(
+        snapshot: *const Snapshot,
+        path: Slice,
+        range: SnapshotRange,
+        context: *mut c_void,
+        visit: Option<EntryVisitor>,
+    ) -> Status;
     pub fn siphon_snapshot_read(
         snapshot: *const Snapshot,
         path: Slice,

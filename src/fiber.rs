@@ -10,8 +10,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
 use crate::{
-    Answer, ChangeHandle, Error, Request, Result, Runtime, SnapshotHandle, borrow_slice, check,
-    compatible, discard_panic, handle, panic_message, present, release_context, slice, sys, take,
+    Answer, ChangeHandle, Entry, Error, Range, Request, Result, Runtime, SnapshotHandle,
+    borrow_slice, check, compatible, discard_panic, handle, panic_message, present,
+    release_context, slice, sys, take,
 };
 
 /// Fibers and request handlers to register before opening a runtime.
@@ -249,6 +250,16 @@ impl<'a> Run<'a> {
 
     pub fn is_stop_handler(&self) -> bool {
         self.stop_handler
+    }
+
+    /// Reads one entry from the immutable snapshot for this phase.
+    pub fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
+        self.snapshot.stat(path)
+    }
+
+    /// Reads a directory page from the immutable snapshot for this phase.
+    pub fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
+        self.snapshot.list(path, range)
     }
 
     pub fn sequence(&self) -> Result<u64> {

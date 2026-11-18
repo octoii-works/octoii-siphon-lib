@@ -4,6 +4,7 @@
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
 mod fiber;
 mod request;
+mod snapshot;
 mod sys;
 
 use std::{
@@ -17,6 +18,8 @@ use std::{
 
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use request::{Answer, Asked, Request, Unanswered};
+use snapshot::SnapshotHandle;
+pub use snapshot::{Directory, Entry, Range, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -262,105 +265,10 @@ impl ChangeHandle {
     }
 }
 
-#[derive(Debug)]
-pub struct Snapshot(SnapshotHandle);
-// SAFETY: native snapshots are immutable and support concurrent reads.
-unsafe impl Send for Snapshot {}
-// SAFETY: as above; Rust ownership prevents concurrent free.
-unsafe impl Sync for Snapshot {}
-impl Snapshot {
-    pub fn sequence(&self) -> Result<u64> {
-        self.0.sequence()
-    }
-    pub fn read(&self, path: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.read_range(path, 0, u64::MAX)
-    }
-    pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        self.0.read_range(path, offset, length)
-    }
-    /// Reads the outcome at `process`, returning `None` when the path has no process record.
-    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        self.0.outcome::<P>(process)
-    }
-}
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        // SAFETY: snapshot is uniquely owned and released once.
-        unsafe { sys::siphon_snapshot_free(self.0.0.as_ptr()) };
-    }
-}
-
-// A live handle backed by either a retained snapshot or the current phase.
-#[derive(Debug)]
-struct SnapshotHandle(NonNull<sys::Snapshot>);
-
-impl SnapshotHandle {
-    fn sequence(&self) -> Result<u64> {
-        let mut seq = 0;
-        // SAFETY: live snapshot and writable output.
-        check(unsafe { sys::siphon_snapshot_seq(self.0.as_ptr(), &mut seq) })?;
-        Ok(seq)
-    }
-    fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        let mut out = sys::Buffer::default();
-        // SAFETY: snapshot is live, path borrowed for the call, output is writable.
-        let status = unsafe {
-            sys::siphon_snapshot_read(self.0.as_ptr(), slice(path), offset, length, &mut out)
-        };
-        let data = take(out);
-        Ok(present(status)?.then_some(data))
-    }
-    fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        let mut kind = sys::OUTCOME_PENDING;
-        let mut payload = sys::Buffer::default();
-        let mut reason = sys::Buffer::default();
-        // SAFETY: snapshot is live, process is readable for the call, outputs are writable.
-        let status = unsafe {
-            sys::siphon_snapshot_outcome(
-                self.0.as_ptr(),
-                slice(process),
-                &mut kind,
-                &mut payload,
-                &mut reason,
-            )
-        };
-        let payload = take(payload);
-        let reason = take(reason);
-        if !present(status)? {
-            return Ok(None);
-        }
-        let payload = (!payload.is_empty()).then_some(payload);
-        let reason = (!reason.is_empty()).then_some(reason);
-        let outcome = match kind {
-            sys::OUTCOME_PENDING => Outcome::Pending,
-            sys::OUTCOME_COMPLETED => Outcome::Completed(decode(payload.as_deref())?),
-            sys::OUTCOME_FAILED => Outcome::Failed {
-                error: payload,
-                reason,
-            },
-            sys::OUTCOME_STOPPED => Outcome::Stopped {
-                result: decode(payload.as_deref())?,
-                reason,
-            },
-            _ => {
-                return Err(Error {
-                    code: 4,
-                    message: format!("library returned an unknown outcome kind: {kind}"),
-                });
-            }
-        };
-        Ok(Some(outcome))
-    }
-}
-
 fn present(status: sys::Status) -> Result<bool> {
     match check(status) {
         Ok(()) => Ok(true),
         Err(error) if error.code == 1 => Ok(false),
         Err(error) => Err(error),
     }
-}
-
-fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option<T>> {
-    Ok(bytes.map(serde_json::from_slice).transpose()?)
 }
