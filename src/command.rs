@@ -208,19 +208,18 @@ impl Drop for Command {
 impl CommandEvents {
     /// A cancelled wait leaves its event for the next call.
     pub async fn next(&mut self) -> Result<Option<CommandEvent>> {
-        self.events
-            .next(|context, release| {
-                // SAFETY: the reader is live. Native owns context on every path.
-                unsafe {
-                    sys::siphon_command_events_read(
-                        self.handle.as_ptr(),
-                        context,
-                        Some(received),
-                        Some(release),
-                    )
-                }
-            })
-            .await
+        self.events.begin(|context, release| {
+            // SAFETY: the reader is live. Native owns context on every path.
+            unsafe {
+                sys::siphon_command_events_read(
+                    self.handle.as_ptr(),
+                    context,
+                    Some(received),
+                    Some(release),
+                )
+            }
+        })?;
+        self.events.wait().await
     }
 }
 

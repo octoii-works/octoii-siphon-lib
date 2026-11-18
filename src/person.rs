@@ -53,7 +53,7 @@ impl RuntimeHandle {
         check(unsafe {
             sys::siphon_runtime_person_requests(
                 self.0.as_ptr(),
-                snapshot.0.0.as_ptr(),
+                snapshot.as_ptr(),
                 slice(under),
                 ptr::from_mut(&mut prompts).cast(),
                 Some(collect_request),
@@ -64,7 +64,14 @@ impl RuntimeHandle {
 
     /// Commits a person's answer to the exact request, returning the commit sequence.
     /// A missing or replaced request yields code 1. An unfit answer yields code 2.
-    pub fn answer(&self, id: &RequestId, answer: &Value) -> Result<u64> {
+    pub async fn answer(&self, id: &RequestId, answer: &Value) -> Result<u64> {
+        let (runtime, id, answer) = (self.clone(), id.clone(), answer.clone());
+        tokio::task::spawn_blocking(move || runtime.answer_blocking(&id, &answer))
+            .await
+            .map_err(|error| crate::Error::new(crate::Status::Failed, error.to_string()))?
+    }
+
+    pub fn answer_blocking(&self, id: &RequestId, answer: &Value) -> Result<u64> {
         let mut seq = 0;
         let view = id.view();
         let answer = serde_json::to_vec(answer)?;

@@ -1,57 +1,53 @@
+use bytes::Bytes;
+
 use std::time::Duration;
 
-use octoii_siphon_lib::{Changes, FileKind, NameChange, Namespace, Query, Range, Runtime, Status};
+use octoii_siphon_lib::{Changes, FileKind, Namespace, Query, Range, Runtime, Status};
 
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(directory.path()).unwrap();
-    let mut first = Changes::new().unwrap();
-    first
-        .write(b"file", b"one")
-        .unwrap()
-        .write(b"empty", b"")
-        .unwrap();
-    let seq = runtime.commit(&first).unwrap();
+    let mut first = Changes::new();
+    first.write(b"file", b"one").write(b"empty", b"");
+    let seq = runtime.commit_blocking(&first).unwrap();
     let before = runtime.snapshot().unwrap();
     assert!(before.sequence().unwrap() >= seq);
-    assert_eq!(before.read(b"empty").unwrap(), Some(vec![]));
+    assert_eq!(before.read(b"empty").unwrap(), Some(Bytes::new()));
     assert_eq!(before.read(b"missing").unwrap(), None);
-    let mut second = Changes::new().unwrap();
-    second.write(b"file", b"two").unwrap();
-    runtime.commit(&second).unwrap();
-    assert_eq!(before.read(b"file").unwrap(), Some(b"one".to_vec()));
+    let mut second = Changes::new();
+    second.write(b"file", b"two");
+    runtime.commit_blocking(&second).unwrap();
+    assert_eq!(
+        before.read(b"file").unwrap(),
+        Some(Bytes::from_static(b"one"))
+    );
     runtime.close().unwrap();
     assert_eq!(runtime.snapshot().unwrap_err().code, 3);
     assert_eq!(
         before.read_range(b"file", 1, 1).unwrap(),
-        Some(b"n".to_vec())
+        Some(Bytes::from_static(b"n"))
     );
     drop(before);
     drop(runtime);
     let reopened = Runtime::open(directory.path()).unwrap();
     assert_eq!(
         reopened.snapshot().unwrap().read(b"file").unwrap(),
-        Some(b"two".to_vec())
+        Some(Bytes::from_static(b"two"))
     );
 }
 
 #[test]
 fn directory_pages_and_entries_are_owned_after_runtime_close() {
     let runtime = Runtime::memory().unwrap();
-    let mut changes = Changes::new().unwrap();
+    let mut changes = Changes::new();
     changes
         .mkdir(b"data")
-        .unwrap()
         .mkdir(b"data/empty")
-        .unwrap()
         .write(b"data/p-b", b"other")
-        .unwrap()
         .write(b"data/p-a", b"")
-        .unwrap()
-        .write(b"data/p\xff", b"raw")
-        .unwrap();
-    let seq = runtime.commit(&changes).unwrap();
+        .write(b"data/p\xff", b"raw");
+    let seq = runtime.commit_blocking(&changes).unwrap();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -62,9 +58,9 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
     };
     let forward = snapshot.list(b"data", &range).unwrap().unwrap();
     assert_eq!(forward.len(), 2);
-    assert_eq!(forward[0].name, b"p-a");
+    assert_eq!(forward[0].name, Bytes::from_static(b"p-a"));
     assert_eq!(forward[0].length, 0);
-    assert_eq!(forward[1].name, b"p-b");
+    assert_eq!(forward[1].name, Bytes::from_static(b"p-b"));
     let next = snapshot
         .list(
             b"data",
@@ -76,7 +72,7 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
         .unwrap()
         .unwrap();
     assert_eq!(next.len(), 1);
-    assert_eq!(next[0].name, b"p\xff");
+    assert_eq!(next[0].name, Bytes::from_static(b"p\xff"));
 
     let reverse = snapshot
         .list(
@@ -89,8 +85,8 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
         .unwrap()
         .unwrap();
     assert_eq!(reverse.len(), 2);
-    assert_eq!(reverse[0].name, b"p\xff");
-    assert_eq!(reverse[1].name, b"p-b");
+    assert_eq!(reverse[0].name, Bytes::from_static(b"p\xff"));
+    assert_eq!(reverse[1].name, Bytes::from_static(b"p-b"));
     let earlier = snapshot
         .list(
             b"data",
@@ -103,7 +99,7 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
         .unwrap()
         .unwrap();
     assert_eq!(earlier.len(), 1);
-    assert_eq!(earlier[0].name, b"p-a");
+    assert_eq!(earlier[0].name, Bytes::from_static(b"p-a"));
 
     assert_eq!(
         snapshot.list(b"data/empty", &range).unwrap(),
@@ -127,40 +123,28 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
 #[test]
 fn metadata_and_index_pages_follow_their_snapshot() {
     let runtime = Runtime::memory().unwrap();
-    let mut changes = Changes::new().unwrap();
-    changes
-        .mkdir(b"team")
-        .unwrap()
-        .mkdir(b"team-other")
-        .unwrap();
+    let mut changes = Changes::new();
+    changes.mkdir(b"team").mkdir(b"team-other");
     let entries: &[(&[u8], &[u8])] = &[
         (b"team/item:b", b"ready"),
         (b"team/item:a", b""),
         (b"team/item:\xff", b"\xfe"),
         (b"team-other/item:a", b""),
     ];
-    let tag = |value: Option<&'static [u8]>| NameChange {
-        name: b"tag",
-        value,
-    };
+    let tag =
+        |value: Option<&'static [u8]>| (Bytes::from_static(b"tag"), value.map(Bytes::from_static));
     for &(path, value) in entries {
-        changes
-            .mkdir(path)
-            .unwrap()
-            .meta(path, &[tag(Some(value))], &[])
-            .unwrap();
+        changes.mkdir(path).meta(path, &[tag(Some(value))], &[]);
     }
-    changes
-        .meta(
-            b"team/item:a",
-            &[],
-            &[NameChange {
-                name: b"note",
-                value: Some(b"\x00\xff"),
-            }],
-        )
-        .unwrap();
-    runtime.commit(&changes).unwrap();
+    changes.meta(
+        b"team/item:a",
+        &[],
+        &[(
+            Bytes::from_static(b"note"),
+            Some(Bytes::from_static(b"\x00\xff")),
+        )],
+    );
+    runtime.commit_blocking(&changes).unwrap();
     let before = runtime.snapshot().unwrap();
 
     let query = Query {
@@ -171,11 +155,14 @@ fn metadata_and_index_pages_follow_their_snapshot() {
     };
     let first = before.find(&query, 1).unwrap();
     assert_eq!(first.len(), 1);
-    assert_eq!(first[0].path, b"team/item:a");
+    assert_eq!(first[0].path, Bytes::from_static(b"team/item:a"));
     assert!(first[0].value.is_empty());
     let entry = first[0].entry.directory.as_ref().unwrap();
-    assert_eq!(entry.label(b"tag"), Some(b"".as_slice()));
-    assert_eq!(entry.annotation(b"note"), Some(b"\x00\xff".as_slice()));
+    assert_eq!(entry.label(b"tag").map(Bytes::as_ref), Some(b"".as_slice()));
+    assert_eq!(
+        entry.annotation(b"note").map(Bytes::as_ref),
+        Some(b"\x00\xff".as_slice())
+    );
 
     let rest = before
         .find(
@@ -187,8 +174,8 @@ fn metadata_and_index_pages_follow_their_snapshot() {
         )
         .unwrap();
     assert_eq!(rest.len(), 2);
-    assert_eq!(rest[0].path, b"team/item:b");
-    assert_eq!(rest[1].path, b"team/item:\xff");
+    assert_eq!(rest[0].path, Bytes::from_static(b"team/item:b"));
+    assert_eq!(rest[1].path, Bytes::from_static(b"team/item:\xff"));
     let exact = before
         .find(
             &Query {
@@ -201,20 +188,15 @@ fn metadata_and_index_pages_follow_their_snapshot() {
     assert_eq!(exact, rest[1..]);
     assert!(before.find(&query, 0).unwrap().is_empty());
 
-    let mut update = Changes::new().unwrap();
+    let mut update = Changes::new();
     update
         .meta(
             b"team/item:a",
             &[tag(None)],
-            &[NameChange {
-                name: b"note",
-                value: None,
-            }],
+            &[(Bytes::from_static(b"note"), None)],
         )
-        .unwrap()
-        .meta(b"team/item:b", &[tag(Some(b""))], &[])
-        .unwrap();
-    runtime.commit(&update).unwrap();
+        .meta(b"team/item:b", &[tag(Some(b""))], &[]);
+    runtime.commit_blocking(&update).unwrap();
     let after = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -225,7 +207,7 @@ fn metadata_and_index_pages_follow_their_snapshot() {
     assert_eq!(before.find(&empty, 10).unwrap(), first);
     let found = after.find(&empty, 10).unwrap();
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].path, b"team/item:b");
+    assert_eq!(found[0].path, Bytes::from_static(b"team/item:b"));
     let removed = after
         .stat(b"team/item:a")
         .unwrap()
@@ -247,20 +229,16 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
     );
     assert!(!initial.missed);
 
-    let mut write = Changes::new().unwrap();
-    write.write(b"raw\xff", b"one").unwrap();
-    let first = runtime.commit(&write).unwrap();
+    let mut write = Changes::new();
+    write.write(b"raw\xff", b"one");
+    let first = runtime.commit_blocking(&write).unwrap();
     let retained = runtime.snapshot().unwrap();
-    let empty = runtime.commit(&Changes::new().unwrap()).unwrap();
+    let empty = runtime.commit_blocking(&Changes::new()).unwrap();
     assert!(empty > first);
 
-    let mut rewrite = Changes::new().unwrap();
-    rewrite
-        .delete(b"raw\xff")
-        .unwrap()
-        .write(b"new", b"two")
-        .unwrap();
-    let last = runtime.commit(&rewrite).unwrap();
+    let mut rewrite = Changes::new();
+    rewrite.delete(b"raw\xff").write(b"new", b"two");
+    let last = runtime.commit_blocking(&rewrite).unwrap();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -288,9 +266,14 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
         next.change_sets[0]
             .paths
             .iter()
-            .any(|path| path == b"raw\xff")
+            .any(|path| path.as_ref() == b"raw\xff")
     );
-    assert!(next.change_sets[0].paths.iter().any(|path| path == b"new"));
+    assert!(
+        next.change_sets[0]
+            .paths
+            .iter()
+            .any(|path| path.as_ref() == b"new")
+    );
     assert!(snapshot.journal(last, 1).unwrap().change_sets.is_empty());
 
     let old = retained.journal(0, 10).unwrap();
@@ -309,30 +292,27 @@ fn volume_ids_and_file_retention_survive_reopening() {
     assert!(now > 0);
     let deadline = now + 60_000;
 
-    let mut changes = Changes::new().unwrap();
+    let mut changes = Changes::new();
     changes
         .write(b"log", b"first")
-        .unwrap()
         .seal(b"log")
-        .unwrap()
-        .expire(b"log", Some(deadline))
-        .unwrap();
-    runtime.commit(&changes).unwrap();
+        .expire(b"log", Some(deadline));
+    runtime.commit_blocking(&changes).unwrap();
     let before = runtime.snapshot().unwrap();
     assert_eq!(
         before.stat(b"log").unwrap().unwrap().expires_at,
         Some(deadline)
     );
 
-    let mut blocked = Changes::new().unwrap();
-    blocked.append(b"log", b"later").unwrap();
+    let mut blocked = Changes::new();
+    blocked.append(b"log", b"later");
     assert_eq!(
-        runtime.commit(&blocked).unwrap_err().status(),
+        runtime.commit_blocking(&blocked).unwrap_err().status(),
         Status::ReadOnly
     );
-    let mut clear = Changes::new().unwrap();
-    clear.expire(b"log", None).unwrap();
-    runtime.commit(&clear).unwrap();
+    let mut clear = Changes::new();
+    clear.expire(b"log", None);
+    runtime.commit_blocking(&clear).unwrap();
     let after = runtime.snapshot().unwrap();
     assert_eq!(
         before.stat(b"log").unwrap().unwrap().expires_at,
@@ -362,7 +342,7 @@ fn volume_ids_and_file_retention_survive_reopening() {
         None
     );
     assert_eq!(
-        reopened.commit(&blocked).unwrap_err().status(),
+        reopened.commit_blocking(&blocked).unwrap_err().status(),
         Status::ReadOnly
     );
 }
@@ -376,18 +356,18 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
         runtime.snapshot().unwrap().sequence().unwrap()
     );
 
-    let mut rejected = Changes::new().unwrap();
-    rejected.write(b"absent/child", b"no").unwrap();
-    assert!(runtime.commit(&rejected).is_err());
+    let mut rejected = Changes::new();
+    rejected.write(b"absent/child", b"no");
+    assert!(runtime.commit_blocking(&rejected).is_err());
     assert!(
         tokio::time::timeout(Duration::from_millis(25), watch.changed())
             .await
             .is_err()
     );
 
-    let mut batch = Changes::new().unwrap();
-    batch.write(b"file", b"one").unwrap();
-    let first = runtime.commit(&batch).unwrap();
+    let mut batch = Changes::new();
+    batch.write(b"file", b"one");
+    let first = runtime.commit_blocking(&batch).unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), watch.changed())
             .await
@@ -399,9 +379,9 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
     let cancelled = runtime.committed().unwrap();
     assert_eq!(cancelled.sequence(), first);
     drop(cancelled);
-    let mut next = Changes::new().unwrap();
-    next.write(b"file", b"two").unwrap();
-    let second = runtime.commit(&next).unwrap();
+    let mut next = Changes::new();
+    next.write(b"file", b"two");
+    let second = runtime.commit_blocking(&next).unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), watch.changed())
             .await
@@ -424,30 +404,24 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
 #[test]
 fn a_failed_batch_does_not_commit_earlier_writes() {
     let runtime = Runtime::memory().unwrap();
-    let mut batch = Changes::new().unwrap();
-    let tag = |value: &'static [u8]| NameChange {
-        name: b"tag",
-        value: Some(value),
-    };
+    let mut batch = Changes::new();
+    let tag = |value: &'static [u8]| (Bytes::from_static(b"tag"), Some(Bytes::from_static(value)));
     batch
         .write(b"file", b"before")
-        .unwrap()
         .mkdir(b"record")
-        .unwrap()
-        .meta(b"record", &[tag(b"before")], &[])
-        .unwrap();
-    runtime.commit(&batch).unwrap();
-    let mut invalid = Changes::new().unwrap();
+        .meta(b"record", &[tag(b"before")], &[]);
+    runtime.commit_blocking(&batch).unwrap();
+    let mut invalid = Changes::new();
     invalid
         .write(b"file", b"after")
-        .unwrap()
         .meta(b"record", &[tag(b"after")], &[])
-        .unwrap()
-        .write(b"missing/child", b"bad")
-        .unwrap();
-    assert!(runtime.commit(&invalid).is_err());
+        .write(b"missing/child", b"bad");
+    assert!(runtime.commit_blocking(&invalid).is_err());
     let snapshot = runtime.snapshot().unwrap();
-    assert_eq!(snapshot.read(b"file").unwrap(), Some(b"before".to_vec()));
+    assert_eq!(
+        snapshot.read(b"file").unwrap(),
+        Some(Bytes::from_static(b"before"))
+    );
     let matches = snapshot
         .find(
             &Query {
@@ -458,7 +432,7 @@ fn a_failed_batch_does_not_commit_earlier_writes() {
             1,
         )
         .unwrap();
-    assert_eq!(matches[0].value, b"before");
+    assert_eq!(matches[0].value, Bytes::from_static(b"before"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -501,22 +475,19 @@ fn a_namespace_mounts_host_and_read_only_volume_views() {
     assert_eq!(names[0].name.as_ref(), b"one");
 
     let runtime = Runtime::memory().unwrap();
-    let mut changes = Changes::new().unwrap();
+    let mut changes = Changes::new();
     changes
         .mkdir(b"document:first")
-        .unwrap()
         .meta(
             b"document:first",
-            &[NameChange {
-                name: b"visible",
-                value: Some(b"yes"),
-            }],
+            &[(
+                Bytes::from_static(b"visible"),
+                Some(Bytes::from_static(b"yes")),
+            )],
             &[],
         )
-        .unwrap()
-        .write(b"document:first/note", b"from the volume")
-        .unwrap();
-    runtime.commit(&changes).unwrap();
+        .write(b"document:first/note", b"from the volume");
+    runtime.commit_blocking(&changes).unwrap();
     namespace
         .mount_labels(&runtime, "documents", "document", "visible", b"")
         .unwrap();

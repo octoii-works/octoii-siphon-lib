@@ -47,19 +47,18 @@ impl RuntimeHandle {
 impl Following {
     /// Reads the next event. A cancelled wait leaves its event for the next call.
     pub async fn next(&mut self) -> Result<Option<StreamEvent>> {
-        self.events
-            .next(|context, release| {
-                // SAFETY: the follower is live. Native owns context on every path.
-                unsafe {
-                    sys::siphon_following_read(
-                        self.handle.as_ptr(),
-                        context,
-                        Some(received),
-                        Some(release),
-                    )
-                }
-            })
-            .await
+        self.events.begin(|context, release| {
+            // SAFETY: the follower is live. Native owns context on every path.
+            unsafe {
+                sys::siphon_following_read(
+                    self.handle.as_ptr(),
+                    context,
+                    Some(received),
+                    Some(release),
+                )
+            }
+        })?;
+        self.events.wait().await
     }
 }
 

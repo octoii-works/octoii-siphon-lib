@@ -3,39 +3,42 @@ use std::{
     ptr::{self, NonNull},
 };
 
+use bytes::Bytes;
+
 use crate::{
     Error, Fiber, Outcome, Result, borrow_slice, check, optional_slice, present, slice, sys, take,
 };
 
 /// Directory labels and annotations are byte pairs. Sequences refer to committed volume changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Directory {
-    pub labels: Vec<(Vec<u8>, Vec<u8>)>,
-    pub annotations: Vec<(Vec<u8>, Vec<u8>)>,
+    pub labels: Vec<(Bytes, Bytes)>,
+    pub annotations: Vec<(Bytes, Bytes)>,
     pub created_seq: u64,
     pub changed_seq: u64,
+    pub removing: bool,
 }
 
 impl Directory {
-    pub fn label(&self, name: &[u8]) -> Option<&[u8]> {
+    pub fn label(&self, name: &[u8]) -> Option<&Bytes> {
         self.labels
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_slice())
+            .map(|(_, value)| value)
     }
 
-    pub fn annotation(&self, name: &[u8]) -> Option<&[u8]> {
+    pub fn annotation(&self, name: &[u8]) -> Option<&Bytes> {
         self.annotations
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_slice())
+            .map(|(_, value)| value)
     }
 }
 
 /// An owned entry from a snapshot. Directory metadata is present for directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    pub name: Vec<u8>,
+    pub name: Bytes,
     pub length: u64,
     /// Expiration in milliseconds since the Unix epoch, when set.
     pub expires_at: Option<i64>,
@@ -66,8 +69,8 @@ pub struct Query<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
-    pub path: Vec<u8>,
-    pub value: Vec<u8>,
+    pub path: Bytes,
+    pub value: Bytes,
     pub entry: Entry,
 }
 
@@ -75,7 +78,7 @@ pub struct Found {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeSet {
     pub seq: u64,
-    pub paths: Vec<Vec<u8>>,
+    pub paths: Vec<Bytes>,
 }
 
 /// An owned page of the volume journal read through a snapshot.
@@ -95,82 +98,94 @@ pub struct Journal {
 /// A Fiber's identity, committed result, and current reaping eligibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiberRecord {
-    pub kind: Vec<u8>,
+    pub kind: Bytes,
     pub version: u32,
     pub created_seq: u64,
     /// A wait deadline in milliseconds since the Unix epoch, when set.
     pub waits_until: Option<i64>,
-    pub usage: Vec<(Vec<u8>, u64)>,
+    pub usage: Vec<(Bytes, u64)>,
     /// The Fiber has ended and its record can be reaped.
     pub reapable: bool,
     /// The recorded outcome. It can be available while descendants are still exiting.
-    pub outcome: Outcome<Vec<u8>>,
+    pub outcome: Option<Outcome>,
 }
 
+/// A view of one committed revision. It may be retained or borrowed from a Fiber phase.
+#[repr(transparent)]
 #[derive(Debug)]
-pub struct Snapshot(pub(crate) SnapshotHandle);
-// SAFETY: native snapshots are immutable and support concurrent reads.
+pub struct Snapshot(sys::Snapshot);
+
+// SAFETY: snapshots are immutable and native supports concurrent reads of a live view.
 unsafe impl Send for Snapshot {}
-// SAFETY: as above; Rust ownership prevents concurrent free.
+// SAFETY: as above.
 unsafe impl Sync for Snapshot {}
+
+/// A retained snapshot, independent of the runtime's subsequent commits.
+#[derive(Debug)]
+pub struct OwnedSnapshot(pub(crate) NonNull<Snapshot>);
+
+// SAFETY: the view is immutable and its native resources are released by the owner.
+unsafe impl Send for OwnedSnapshot {}
+// SAFETY: as above. Freeing a snapshot requires exclusive Rust ownership.
+unsafe impl Sync for OwnedSnapshot {}
+
+impl std::ops::Deref for OwnedSnapshot {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Snapshot {
+        // SAFETY: the owner holds this native snapshot until Drop.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl Drop for OwnedSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: the owner releases the native snapshot once.
+        unsafe { sys::siphon_snapshot_free(self.0.as_ptr().cast()) };
+    }
+}
+
 impl Snapshot {
-    /// Returns the entry at this byte path, if present.
-    pub fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
-        self.0.stat(path)
+    pub(crate) fn as_ptr(&self) -> *const sys::Snapshot {
+        ptr::from_ref(self).cast()
     }
 
-    /// Reads a page in byte name order. A missing directory yields None and an empty page yields Some.
-    pub fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
-        self.0.list(path, range)
-    }
-
-    /// Finds indexed directories in full byte path order, up to the limit.
-    pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
-        self.0.find(query, limit)
-    }
-
-    /// Reads at most limit commits strictly after the cursor.
-    pub fn journal(&self, after: u64, limit: usize) -> Result<Journal> {
-        self.0.journal(after, limit)
-    }
-
-    pub fn sequence(&self) -> Result<u64> {
-        self.0.sequence()
-    }
-    pub fn read(&self, path: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, path: &[u8]) -> Result<Option<Bytes>> {
         self.read_range(path, 0, u64::MAX)
     }
-    pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        self.0.read_range(path, offset, length)
-    }
-    /// Returns the Fiber record at this path, if present.
-    pub fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
-        self.0.fiber(process)
+
+    /// Whether this snapshot has an unanswered request below a volume path.
+    pub fn has_pending_requests(&self, under: &[u8]) -> Result<bool> {
+        let mut found = 0;
+        // SAFETY: snapshot and path are live and found is writable.
+        check(unsafe {
+            sys::siphon_snapshot_has_requests(self.as_ptr(), slice(under), &mut found)
+        })?;
+        Ok(found != 0)
     }
 
-    /// Decodes the outcome for the stated Fiber kind and version from the same record.
-    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        self.0.outcome::<P>(process)
+    /// Lists direct child Fibers of the stated kind. An empty kind lists every child Fiber.
+    pub fn fibers(&self, parent: &[u8], kind: &[u8]) -> Result<Vec<Bytes>> {
+        let mut paths: Vec<Bytes> = Vec::new();
+        // SAFETY: the snapshot and both inputs stay live. The visitor exclusively borrows paths.
+        check(unsafe {
+            sys::siphon_snapshot_fibers(
+                self.as_ptr(),
+                slice(parent),
+                slice(kind),
+                ptr::from_mut(&mut paths).cast(),
+                Some(collect_path),
+            )
+        })?;
+        Ok(paths)
     }
-}
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        // SAFETY: snapshot is uniquely owned and released once.
-        unsafe { sys::siphon_snapshot_free(self.0.0.as_ptr()) };
-    }
-}
 
-// A live handle backed by either a retained snapshot or the current phase.
-#[derive(Debug)]
-pub(crate) struct SnapshotHandle(pub(crate) NonNull<sys::Snapshot>);
-
-impl SnapshotHandle {
-    pub(crate) fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
+    pub fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
         let mut entries = Vec::new();
         // SAFETY: the snapshot and path are live. collect_entry receives exclusive access to entries.
         let status = unsafe {
             sys::siphon_snapshot_stat(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 slice(path),
                 ptr::from_mut(&mut entries).cast(),
                 Some(collect_entry),
@@ -185,7 +200,7 @@ impl SnapshotHandle {
         })
     }
 
-    pub(crate) fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
+    pub fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
         let mut entries = Vec::new();
         let range = sys::SnapshotRange {
             prefix: slice(range.prefix),
@@ -196,7 +211,7 @@ impl SnapshotHandle {
         // SAFETY: the snapshot, path and range slices are live. The callback is synchronous.
         let status = unsafe {
             sys::siphon_snapshot_list(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 slice(path),
                 range,
                 ptr::from_mut(&mut entries).cast(),
@@ -206,7 +221,7 @@ impl SnapshotHandle {
         Ok(present(status)?.then_some(entries))
     }
 
-    pub(crate) fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
+    pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
         let mut matches = Vec::new();
         let query = sys::SnapshotQuery {
             kind: slice(query.kind),
@@ -219,7 +234,7 @@ impl SnapshotHandle {
         // SAFETY: the snapshot and query slices are live. The visitor has exclusive access to matches.
         check(unsafe {
             sys::siphon_snapshot_find(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 query,
                 ptr::from_mut(&mut matches).cast(),
                 Some(collect_found),
@@ -228,12 +243,12 @@ impl SnapshotHandle {
         Ok(matches)
     }
 
-    fn journal(&self, after: u64, limit: usize) -> Result<Journal> {
+    pub fn journal(&self, after: u64, limit: usize) -> Result<Journal> {
         let mut page = None;
         // SAFETY: the snapshot is live. The synchronous visitor writes into page exclusively.
         check(unsafe {
             sys::siphon_snapshot_journal(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 after,
                 limit,
                 ptr::from_mut(&mut page).cast(),
@@ -246,32 +261,27 @@ impl SnapshotHandle {
         })
     }
 
-    pub(crate) fn sequence(&self) -> Result<u64> {
+    pub fn sequence(&self) -> Result<u64> {
         let mut seq = 0;
         // SAFETY: live snapshot and writable output.
-        check(unsafe { sys::siphon_snapshot_seq(self.0.as_ptr(), &mut seq) })?;
+        check(unsafe { sys::siphon_snapshot_seq(self.as_ptr(), &mut seq) })?;
         Ok(seq)
     }
-    pub(crate) fn read_range(
-        &self,
-        path: &[u8],
-        offset: u64,
-        length: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Bytes>> {
         let mut out = sys::Buffer::default();
         // SAFETY: snapshot is live, path borrowed for the call, output is writable.
         let status = unsafe {
-            sys::siphon_snapshot_read(self.0.as_ptr(), slice(path), offset, length, &mut out)
+            sys::siphon_snapshot_read(self.as_ptr(), slice(path), offset, length, &mut out)
         };
         let data = take(out);
-        Ok(present(status)?.then_some(data))
+        Ok(present(status)?.then_some(Bytes::from(data)))
     }
-    pub(crate) fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
+    pub fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
         let mut record: Option<Result<FiberRecord>> = None;
         // SAFETY: the snapshot and path are live. The visitor writes into record exclusively.
         let status = unsafe {
             sys::siphon_snapshot_fiber(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 slice(process),
                 ptr::from_mut(&mut record).cast(),
                 Some(collect_fiber),
@@ -288,7 +298,7 @@ impl SnapshotHandle {
             .map(Some)
     }
 
-    pub(crate) fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         let Some(record) = self.fiber(process)? else {
             return Ok(None);
         };
@@ -298,8 +308,10 @@ impl SnapshotHandle {
                 message: "the Fiber at this path has a different kind or version".into(),
             });
         }
-        let outcome = match record.outcome {
-            Outcome::Pending => Outcome::Pending,
+        let Some(outcome) = record.outcome else {
+            return Ok(None);
+        };
+        let outcome = match outcome {
             Outcome::Completed(result) => Outcome::Completed(decode(result.as_deref())?),
             Outcome::Failed { error, reason } => Outcome::Failed { error, reason },
             Outcome::Stopped { result, reason } => Outcome::Stopped {
@@ -321,7 +333,7 @@ unsafe fn borrow_array<'a, T>(data: *const T, len: usize) -> &'a [T] {
 }
 
 /// Safety: the native metadata view and its bytes must be valid for this visit.
-unsafe fn copy_named(values: &sys::NamedSlice) -> Vec<(Vec<u8>, Vec<u8>)> {
+unsafe fn copy_named(values: &sys::NamedSlice) -> Vec<(Bytes, Bytes)> {
     // SAFETY: the native library keeps the array and all of its byte slices live for the visit.
     unsafe { borrow_array(values.data, values.len) }
         .iter()
@@ -329,8 +341,8 @@ unsafe fn copy_named(values: &sys::NamedSlice) -> Vec<(Vec<u8>, Vec<u8>)> {
             // SAFETY: both byte slices belong to this live metadata array.
             unsafe {
                 (
-                    borrow_slice(item.name).to_vec(),
-                    borrow_slice(item.value).to_vec(),
+                    Bytes::copy_from_slice(borrow_slice(item.name)),
+                    Bytes::copy_from_slice(borrow_slice(item.value)),
                 )
             }
         })
@@ -342,7 +354,7 @@ unsafe fn copy_entry(view: &sys::EntryView) -> Entry {
     // SAFETY: nested pointers are null or refer to data held through this copy.
     unsafe {
         Entry {
-            name: borrow_slice(view.name).to_vec(),
+            name: Bytes::copy_from_slice(borrow_slice(view.name)),
             length: view.length,
             expires_at: view.expires_at.as_ref().copied(),
             directory: view.directory.as_ref().map(|directory| Directory {
@@ -350,6 +362,7 @@ unsafe fn copy_entry(view: &sys::EntryView) -> Entry {
                 annotations: copy_named(&directory.annotations),
                 created_seq: directory.created_seq,
                 changed_seq: directory.changed_seq,
+                removing: directory.removing != 0,
             }),
         }
     }
@@ -370,8 +383,8 @@ unsafe extern "C" fn collect_found(
     let matches = unsafe { &mut *context.cast::<Vec<Found>>() };
     matches.push(unsafe {
         Found {
-            path: borrow_slice(path).to_vec(),
-            value: borrow_slice(value).to_vec(),
+            path: Bytes::copy_from_slice(borrow_slice(path)),
+            value: Bytes::copy_from_slice(borrow_slice(value)),
             entry: copy_entry(&*view),
         }
     });
@@ -387,7 +400,7 @@ unsafe extern "C" fn collect_journal(context: *mut c_void, view: *const sys::Jou
             // SAFETY: the path array and its byte slices remain readable through this visit.
             let paths = unsafe { borrow_array(set.paths, set.paths_len) }
                 .iter()
-                .map(|path| unsafe { borrow_slice(*path) }.to_vec())
+                .map(|path| Bytes::copy_from_slice(unsafe { borrow_slice(*path) }))
                 .collect();
             ChangeSet {
                 seq: set.seq,
@@ -406,9 +419,9 @@ unsafe extern "C" fn collect_journal(context: *mut c_void, view: *const sys::Jou
 }
 
 /// Safety: a present slice must remain readable for this copy.
-unsafe fn copy_optional(value: sys::Slice) -> Option<Vec<u8>> {
+unsafe fn copy_optional(value: sys::Slice) -> Option<Bytes> {
     // SAFETY: the native record keeps present byte slices readable during the visit.
-    (!value.data.is_null()).then(|| unsafe { borrow_slice(value) }.to_vec())
+    (!value.data.is_null()).then(|| Bytes::copy_from_slice(unsafe { borrow_slice(value) }))
 }
 
 /// Safety: the native record and its fields must remain live for this copy.
@@ -416,16 +429,16 @@ unsafe fn copy_fiber(view: &sys::FiberRecordView) -> Result<FiberRecord> {
     // SAFETY: the record holds both optional values until the visitor returns.
     let (payload, reason) = unsafe { (copy_optional(view.payload), copy_optional(view.reason)) };
     let outcome = match view.outcome {
-        sys::OUTCOME_PENDING => Outcome::Pending,
-        sys::OUTCOME_COMPLETED => Outcome::Completed(payload),
-        sys::OUTCOME_FAILED => Outcome::Failed {
+        sys::OUTCOME_PENDING => None,
+        sys::OUTCOME_COMPLETED => Some(Outcome::Completed(payload)),
+        sys::OUTCOME_FAILED => Some(Outcome::Failed {
             error: payload,
             reason,
-        },
-        sys::OUTCOME_STOPPED => Outcome::Stopped {
+        }),
+        sys::OUTCOME_STOPPED => Some(Outcome::Stopped {
             result: payload,
             reason,
-        },
+        }),
         kind => {
             return Err(Error {
                 code: 4,
@@ -436,12 +449,17 @@ unsafe fn copy_fiber(view: &sys::FiberRecordView) -> Result<FiberRecord> {
     // SAFETY: the native visitor keeps the usage array and every name live for this copy.
     let usage = unsafe { borrow_array(view.usage, view.usage_len) }
         .iter()
-        .map(|entry| (unsafe { borrow_slice(entry.name) }.to_vec(), entry.amount))
+        .map(|entry| {
+            (
+                Bytes::copy_from_slice(unsafe { borrow_slice(entry.name) }),
+                entry.amount,
+            )
+        })
         .collect();
     // SAFETY: kind is readable and waits_until is null or borrowed for this visit.
     let (kind, waits_until) = unsafe {
         (
-            borrow_slice(view.kind).to_vec(),
+            Bytes::copy_from_slice(borrow_slice(view.kind)),
             view.waits_until.as_ref().copied(),
         )
     };
@@ -463,4 +481,10 @@ unsafe extern "C" fn collect_fiber(context: *mut c_void, view: *const sys::Fiber
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option<T>> {
     Ok(bytes.map(serde_json::from_slice).transpose()?)
+}
+
+unsafe extern "C" fn collect_path(context: *mut c_void, path: sys::Slice) {
+    // SAFETY: the path is live during the visit and the output is exclusively borrowed.
+    unsafe { &mut *context.cast::<Vec<Bytes>>() }
+        .push(Bytes::copy_from_slice(unsafe { borrow_slice(path) }));
 }

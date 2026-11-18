@@ -16,25 +16,28 @@ impl<Event> Events<Event> {
         Self { pending: None }
     }
 
-    pub(crate) async fn next(
+    pub(crate) fn begin(
         &mut self,
         request: impl FnOnce(*mut c_void, unsafe extern "C" fn(*mut c_void)) -> sys::Status,
-    ) -> Result<Option<Event>> {
+    ) -> Result<()> {
         if self.pending.is_none() {
             let (sender, receiver) = oneshot::channel::<Result<Option<Event>>>();
             let context = Box::into_raw(Box::new(Some(sender))).cast();
             let status = request(context, release_context::<Option<Reply<Event>>>);
             match check(status) {
                 Ok(()) => self.pending = Some(receiver),
-                Err(error) if error.status() == Status::Closed => return Ok(None),
+                Err(error) if error.status() == Status::Closed => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
-        let event = self
-            .pending
-            .as_mut()
-            .expect("an event read is pending")
-            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<Option<Event>> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Ok(None);
+        };
+        let event = pending.await;
         self.pending = None;
         event.unwrap_or(Ok(None))
     }

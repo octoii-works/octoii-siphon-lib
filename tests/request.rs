@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use std::{
     future::{pending, ready},
     panic::panic_any,
@@ -12,7 +14,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Following, Mail, Options,
-    Outcome, PersonRequest, Published, Request, Result, Run, Runtime, Signal, Status, StreamEvent,
+    Outcome, PersonRequest, Published, Request, Run, Runtime, Signal, Status, StreamEvent,
     Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
@@ -27,20 +29,18 @@ fn host() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Vec<u8> {
-    let mut changes = Changes::new().unwrap();
+fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Bytes {
+    let mut changes = Changes::new();
     changes.start::<P>(b"", key, input).unwrap();
-    runtime.commit(&changes).unwrap();
-    process_path(b"", key).unwrap()
+    runtime.commit_blocking(&changes).unwrap();
+    process_path(b"", key)
 }
 
 fn finish<P: Fiber>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let outcome = runtime.snapshot().unwrap().outcome::<P>(process).unwrap();
-        if let Some(outcome) = outcome
-            && !matches!(outcome, Outcome::Pending)
-        {
+        if let Some(outcome) = outcome {
             return outcome;
         }
         assert!(
@@ -88,10 +88,11 @@ impl Fiber for Twice {
         run: &mut Run<'_>,
         input: u32,
         checkpoint: Option<Turn>,
-    ) -> Result<Ending<Turn, Self::Output>> {
+    ) -> anyhow::Result<Ending<Turn, Self::Output>> {
         match checkpoint {
             None => {
-                let key = run.request(&Lookup(input))?;
+                let key = run.new_id()?;
+                run.request(&key, &Lookup(input))?;
                 assert_eq!(run.answer::<Lookup>(&key)?, None);
                 Ok(Ending::Wait(
                     Turn::First(key.clone()),
@@ -107,7 +108,8 @@ impl Fiber for Twice {
                     run.answer::<Lookup>(&first_key)?,
                     Some(Answer::Given(first))
                 );
-                let second_key = run.request(&Lookup(first))?;
+                let second_key = run.new_id()?;
+                run.request(&second_key, &Lookup(first))?;
                 assert_ne!(first_key, second_key);
                 Ok(Ending::Wait(
                     Turn::Second {
@@ -127,8 +129,9 @@ impl Fiber for Twice {
                 let Some(Answer::Given(second)) = run.answer::<Lookup>(&second_key)? else {
                     panic!("second answer missing");
                 };
-                run.take_mail(&second_key)?
-                    .write(b"answers", format!("{first}, {second}").as_bytes())?;
+                run.take_mail(&second_key)?;
+                run.changes
+                    .write(b"answers", format!("{first}, {second}").as_bytes());
                 Ok(Ending::Done((first, second)))
             }
         }
@@ -143,13 +146,15 @@ impl Fiber for Throws {
     type Checkpoint = ();
     type Output = ();
 
-    fn run(&self, run: &mut Run<'_>, _: (), _: Option<()>) -> Result<Ending<(), ()>> {
-        run.request(&Lookup(100))?;
-        run.write(b"throw", b"staged")?;
+    fn run(&self, run: &mut Run<'_>, _: (), _: Option<()>) -> anyhow::Result<Ending<(), ()>> {
+        let key = run.new_id()?;
+        run.request(&key, &Lookup(100))?;
+        run.changes.write(b"throw", b"staged");
         Err(Error {
             code: 4,
             message: "discard this request".into(),
-        })
+        }
+        .into())
     }
 }
 
@@ -236,9 +241,10 @@ impl Fiber for Once {
         run: &mut Run<'_>,
         input: u32,
         checkpoint: Option<String>,
-    ) -> Result<Ending<String, Response>> {
+    ) -> anyhow::Result<Ending<String, Response>> {
         let Some(key) = checkpoint else {
-            let key = run.request(&Lookup(input))?;
+            let key = run.new_id()?;
+            run.request(&key, &Lookup(input))?;
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
         let Some(answer) = run.answer::<Lookup>(&key)?.map(Response::from) else {
@@ -275,25 +281,23 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     let process = start::<Once>(&runtime, b"stop", &42);
     let request = running.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(request.process, process);
-    let mut conflicting = Changes::new().unwrap();
-    conflicting
-        .send(
-            &process,
-            &Mail {
-                key: request.key,
-                name: b"ordinary".to_vec(),
-                payload: b"reserved".to_vec(),
-            },
-            None,
-        )
-        .unwrap();
-    let error = runtime.commit(&conflicting).unwrap_err();
+    let mut conflicting = Changes::new();
+    conflicting.send(
+        &process,
+        Mail {
+            key: request.key.into(),
+            name: Bytes::from_static(b"ordinary"),
+            payload: Bytes::from_static(b"reserved"),
+        },
+        None,
+    );
+    let error = runtime.commit_blocking(&conflicting).unwrap_err();
     assert_eq!(error.status(), Status::Refused);
     assert!(error.message.contains("request-pending"), "{error}");
 
-    let mut changes = Changes::new().unwrap();
-    changes.signal(&process, Signal::Terminate, None).unwrap();
-    runtime.commit(&changes).unwrap();
+    let mut changes = Changes::new();
+    changes.signal(&process, Signal::Terminate, None);
+    runtime.commit_blocking(&changes).unwrap();
     assert_eq!(
         finish::<Once>(&runtime, &process),
         Outcome::Stopped {
@@ -357,12 +361,12 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     let valid = serde_json::json!(42);
     let mut other = original.id.clone();
     other.created_seq += 1;
-    assert_eq!(runtime.answer(&other, &valid).unwrap_err().code, 1);
+    assert_eq!(runtime.answer_blocking(&other, &valid).unwrap_err().code, 1);
     other = original.id.clone();
     other.started += 1;
-    assert_eq!(runtime.answer(&other, &valid).unwrap_err().code, 1);
+    assert_eq!(runtime.answer_blocking(&other, &valid).unwrap_err().code, 1);
     let error = runtime
-        .answer(&original.id, &serde_json::json!(43))
+        .answer_blocking(&original.id, &serde_json::json!(43))
         .unwrap_err();
     assert_eq!(error.code, 2);
     let still_waiting = runtime.snapshot().unwrap();
@@ -374,8 +378,14 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
         std::slice::from_ref(&original),
     );
 
-    assert!(runtime.answer(&original.id, &valid).unwrap() > original.id.created_seq);
-    assert_eq!(runtime.answer(&original.id, &valid).unwrap_err().code, 1);
+    assert!(runtime.answer_blocking(&original.id, &valid).unwrap() > original.id.created_seq);
+    assert_eq!(
+        runtime
+            .answer_blocking(&original.id, &valid)
+            .unwrap_err()
+            .code,
+        1
+    );
     assert_eq!(
         finish::<Once>(&runtime, &process),
         Outcome::Completed(Some(Response::Given(42)))

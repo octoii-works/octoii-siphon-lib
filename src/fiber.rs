@@ -6,15 +6,14 @@ use std::{
     ptr::NonNull,
 };
 
+use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
-use crate::Mail;
-
 use crate::{
-    Answer, ChangeHandle, Entry, Error, FiberRecord, Found, NameChange, Query, Range, Request,
-    Result, Runtime, RuntimeHandle, SnapshotHandle, borrow_slice, check, compatible, discard_panic,
-    handle, panic_message, present, release_context, slice, sys, take,
+    Answer, Batch, Error, Mail, Request, Result, Runtime, RuntimeHandle, Snapshot, borrow_slice,
+    check, compatible, discard_panic, handle, panic_message, present, release_context, slice, sys,
+    take,
 };
 
 /// Fibers and request handlers to register before opening a runtime.
@@ -151,7 +150,7 @@ pub trait Fiber: Send + Sync + 'static {
         run: &mut Run<'_>,
         input: Self::Input,
         checkpoint: Option<Self::Checkpoint>,
-    ) -> Result<Ending<Self::Checkpoint, Self::Output>>;
+    ) -> anyhow::Result<Ending<Self::Checkpoint, Self::Output>>;
 }
 
 /// The ending committed together with the phase's writes.
@@ -205,18 +204,17 @@ impl Wait {
     }
 }
 
-/// A process's pending or recorded result at the time of the snapshot.
+/// A Fiber's recorded result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome<O> {
-    Pending,
+pub enum Outcome<O = Bytes> {
     Completed(Option<O>),
     Failed {
-        error: Option<Vec<u8>>,
-        reason: Option<Vec<u8>>,
+        error: Option<Bytes>,
+        reason: Option<Bytes>,
     },
     Stopped {
         result: Option<O>,
-        reason: Option<Vec<u8>>,
+        reason: Option<Bytes>,
     },
 }
 
@@ -227,8 +225,8 @@ pub struct Run<'a> {
     path: &'a [u8],
     time_ms: i64,
     stop_handler: bool,
-    changes: ChangeHandle,
-    snapshot: SnapshotHandle,
+    pub changes: Batch<'a>,
+    snapshot: &'a Snapshot,
 }
 
 impl<'a> Run<'a> {
@@ -244,8 +242,12 @@ impl<'a> Run<'a> {
             path: unsafe { borrow_slice(path) },
             time_ms,
             stop_handler: stop_handler != 0,
-            changes: ChangeHandle(handle(unsafe { sys::siphon_run_changes(run) })?),
-            snapshot: SnapshotHandle(handle(unsafe { sys::siphon_run_snapshot(run) }.cast_mut())?),
+            changes: Batch::new(handle(unsafe { sys::siphon_run_changes(run) })?),
+            snapshot: unsafe {
+                handle(sys::siphon_run_snapshot(run).cast_mut())?
+                    .cast::<Snapshot>()
+                    .as_ref()
+            },
         })
     }
 
@@ -270,63 +272,29 @@ impl<'a> Run<'a> {
         self.stop_handler
     }
 
-    /// Reads one entry from the immutable snapshot for this phase.
-    pub fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
-        self.snapshot.stat(path)
+    /// Reads the immutable snapshot of this phase.
+    pub fn snapshot(&self) -> &'a Snapshot {
+        self.snapshot
     }
 
-    /// Reads a directory page from the immutable snapshot for this phase.
-    pub fn list(&self, path: &[u8], range: &Range<'_>) -> Result<Option<Vec<Entry>>> {
-        self.snapshot.list(path, range)
-    }
-
-    /// Finds indexed directories in the immutable snapshot for this phase.
-    pub fn find(&self, query: &Query<'_>, limit: usize) -> Result<Vec<Found>> {
-        self.snapshot.find(query, limit)
-    }
-
-    pub fn sequence(&self) -> Result<u64> {
-        self.snapshot.sequence()
-    }
-
-    pub fn read(&self, path: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.read_range(path, 0, u64::MAX)
-    }
-
-    pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        self.snapshot.read_range(path, offset, length)
-    }
-
-    /// Reads a Fiber record from the immutable snapshot for this phase.
-    pub fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
-        self.snapshot.fiber(process)
-    }
-
-    /// Decodes the outcome for the stated Fiber kind and version.
-    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        self.snapshot.outcome::<P>(process)
-    }
-
-    /// Stages a request and returns its mailbox key. Store the key in the checkpoint to read the
-    /// answer in a later phase.
-    pub fn request<R: Request>(&mut self, request: &R) -> Result<String> {
-        let mut key = sys::Buffer::default();
+    /// Stages the request at the given mailbox key.
+    pub fn request<R: Request>(&mut self, key: &str, request: &R) -> Result<()> {
         let payload = to_vec(request)?;
-        // SAFETY: the phase is live and exclusive, the slices are readable, and key is writable.
-        let status = unsafe {
+        // SAFETY: the phase is live and exclusive and all input slices stay readable.
+        check(unsafe {
             sys::siphon_run_request(
                 self.phase.as_ptr(),
+                slice(key.as_bytes()),
                 slice(R::NAME.as_bytes()),
                 slice(&payload),
-                &mut key,
             )
-        };
-        let key = take(key);
-        check(status)?;
-        String::from_utf8(key).map_err(|error| Error {
-            code: 4,
-            message: format!("library returned an invalid request key: {error}"),
         })
+    }
+
+    /// Cancels a pending request in this Fiber's mailbox.
+    pub fn cancel_request(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
+        // SAFETY: the phase is live and exclusive and the key is readable.
+        check(unsafe { sys::siphon_run_cancel_request(self.phase.as_ptr(), slice(key.as_ref())) })
     }
 
     /// Reads the request's answer from this phase's snapshot. Returns `None` when it is absent.
@@ -392,96 +360,10 @@ impl<'a> Run<'a> {
         Ok(self)
     }
 
-    pub fn mkdir(&mut self, path: &[u8]) -> Result<&mut Self> {
-        self.changes.mkdir(path)?;
-        Ok(self)
-    }
-
-    /// Stages label and annotation changes for the phase's commit.
-    pub fn meta(
-        &mut self,
-        path: &[u8],
-        labels: &[NameChange<'_>],
-        annotations: &[NameChange<'_>],
-    ) -> Result<&mut Self> {
-        self.changes.meta(path, labels, annotations)?;
-        Ok(self)
-    }
-
-    pub fn write(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
-        self.changes.write(path, data)?;
-        Ok(self)
-    }
-
-    pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
-        self.changes.append(path, data)?;
-        Ok(self)
-    }
-
-    /// Stages sealing a file in this phase.
-    pub fn seal(&mut self, path: &[u8]) -> Result<&mut Self> {
-        self.changes.seal(path)?;
-        Ok(self)
-    }
-    /// Stages expiration in milliseconds since the Unix epoch. None clears it.
-    pub fn expire(&mut self, path: &[u8], deadline: Option<i64>) -> Result<&mut Self> {
-        self.changes.expire(path, deadline)?;
-        Ok(self)
-    }
-    pub fn delete(&mut self, path: &[u8]) -> Result<&mut Self> {
-        self.changes.delete(path)?;
-        Ok(self)
-    }
-
-    pub fn start<P: Fiber>(
-        &mut self,
-        parent: &[u8],
-        key: &[u8],
-        input: &P::Input,
-    ) -> Result<&mut Self> {
-        self.changes.start::<P>(parent, key, input)?;
-        Ok(self)
-    }
-
-    /// Stages mail. A started sequence fences delivery to that Fiber incarnation.
-    pub fn send(&mut self, process: &[u8], mail: &Mail, started: Option<u64>) -> Result<&mut Self> {
-        self.changes.send(process, mail, started)?;
-        Ok(self)
-    }
-
-    /// Stages a signal to the Fiber and its descendants.
-    pub fn signal(
-        &mut self,
-        process: &[u8],
-        signal: crate::Signal,
-        reason: Option<&[u8]>,
-    ) -> Result<&mut Self> {
-        self.changes.signal(process, signal, reason)?;
-        Ok(self)
-    }
-
-    /// Stages removal after the Fibers under path have had a chance to stop.
-    pub fn remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
-        self.changes.remove(path, reason)?;
-        Ok(self)
-    }
-
-    /// Stages removal by killing live Fibers under path.
-    pub fn force_remove(&mut self, path: &[u8], reason: Option<&[u8]>) -> Result<&mut Self> {
-        self.changes.force_remove(path, reason)?;
-        Ok(self)
-    }
-
-    /// Stages reaping an ended Fiber record.
-    pub fn reap(&mut self, process: &[u8]) -> Result<&mut Self> {
-        self.changes.reap(process)?;
-        Ok(self)
-    }
-
-    /// Stages usage charges to the Fiber and its ancestors.
-    pub fn charge(&mut self, process: &[u8], counters: &[(&[u8], u64)]) -> Result<&mut Self> {
-        self.changes.charge(process, counters)?;
-        Ok(self)
+    /// Starts a direct child of this Fiber in the same commit.
+    pub fn start<P: Fiber>(&mut self, key: impl AsRef<[u8]>, input: &P::Input) -> Result<()> {
+        self.changes.start::<P>(self.path, key, input)?;
+        Ok(())
     }
 }
 
@@ -491,9 +373,9 @@ unsafe extern "C" fn collect_mail(context: *mut c_void, view: *const sys::MailVi
     // SAFETY: all three slices are readable during this visit.
     *mail = Some(unsafe {
         Mail {
-            key: borrow_slice(view.key).to_vec(),
-            name: borrow_slice(view.name).to_vec(),
-            payload: borrow_slice(view.payload).to_vec(),
+            key: Bytes::copy_from_slice(borrow_slice(view.key)),
+            name: Bytes::copy_from_slice(borrow_slice(view.name)),
+            payload: Bytes::copy_from_slice(borrow_slice(view.payload)),
         }
     });
 }
@@ -504,7 +386,7 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
     input: sys::Slice,
     checkpoint: sys::Slice,
 ) {
-    let executed = catch_unwind(AssertUnwindSafe(|| {
+    let executed = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<()> {
         // SAFETY: registration keeps context and callback data alive until this call returns.
         let fiber = unsafe { &*context.cast::<P>() };
         let (input, checkpoint) = unsafe { (borrow_slice(input), borrow_slice(checkpoint)) };
@@ -516,12 +398,14 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
         // SAFETY: this is the unique live callback handle for this invocation.
         let mut scoped = unsafe { Run::new(&mut phase)? };
         let ending = fiber.run(&mut scoped, input, checkpoint)?;
-        finish(run, ending)
+        scoped.changes.ready()?;
+        finish(run, ending)?;
+        Ok(())
     }));
     match executed {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let _ = end(run, sys::END_THROW, error.message.as_bytes());
+            let _ = end(run, sys::END_THROW, format!("{error:#}").as_bytes());
         }
         Err(panic) => {
             let message = panic_message(panic.as_ref());

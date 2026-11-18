@@ -45,6 +45,7 @@ typedef struct {
     siphon_named_slice annotations;
     uint64_t created_seq;
     uint64_t changed_seq;
+    uint8_t removing;
 } siphon_directory_view;
 typedef struct {
     siphon_slice name;
@@ -100,6 +101,7 @@ typedef void (*siphon_found_visitor)(void *context, siphon_slice path, siphon_sl
     const siphon_entry_view *entry);
 typedef void (*siphon_journal_visitor)(void *context, const siphon_journal_view *page);
 typedef void (*siphon_fiber_visitor)(void *context, const siphon_fiber_record_view *record);
+typedef void (*siphon_fiber_path_visitor)(void *context, siphon_slice path);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_commit_callback)(void *context, uint64_t seq);
@@ -277,6 +279,10 @@ siphon_status siphon_runtime_watch_commits(const siphon_runtime *runtime, void *
 /* Requests cancellation. Release runs after the last notification, including during runtime close. */
 void siphon_commit_watch_free(siphon_commit_watch *watch);
 siphon_status siphon_changes_new(siphon_changes **out);
+uint8_t siphon_changes_is_empty(const siphon_changes *changes);
+siphon_status siphon_changes_extend(siphon_changes *changes, siphon_changes *other);
+siphon_status siphon_changes_rename(siphon_changes *changes, siphon_slice from, siphon_slice to);
+siphon_status siphon_changes_limit(siphon_changes *changes, siphon_slice process, siphon_slice counter, uint64_t maximum);
 void siphon_changes_free(siphon_changes *changes);
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);
 /* The batch copies the metadata pairs during the call. A null, zero-length value removes the name.
@@ -317,7 +323,8 @@ siphon_status siphon_run_wait_until(siphon_run *run, int64_t deadline);
 /* Stage a request and return its unique key. A missing answer returns status 1.
  * The outputs belong to the library; free them with siphon_buffer_free.
  */
-siphon_status siphon_run_request(siphon_run *run, siphon_slice name, siphon_slice payload, siphon_buffer *key);
+siphon_status siphon_run_request(siphon_run *run, siphon_slice key, siphon_slice name, siphon_slice payload);
+siphon_status siphon_run_cancel_request(siphon_run *run, siphon_slice key);
 siphon_status siphon_run_answer(const siphon_run *run, siphon_slice key, uint32_t *kind, siphon_buffer *payload);
 /* A synchronous visitor borrows the phase's mail. An absent entry returns status 1.
  * The visitor must not unwind or mutate the phase. Mail keys, names and payloads are bytes.
@@ -371,6 +378,9 @@ siphon_status siphon_snapshot_journal(const siphon_snapshot *snapshot, uint64_t 
  */
 siphon_status siphon_snapshot_fiber(const siphon_snapshot *snapshot, siphon_slice process, void *context,
     siphon_fiber_visitor visit);
+siphon_status siphon_snapshot_fibers(const siphon_snapshot *snapshot, siphon_slice parent, siphon_slice kind,
+    void *context, siphon_fiber_path_visitor visit);
+siphon_status siphon_snapshot_has_requests(const siphon_snapshot *snapshot, siphon_slice under, uint8_t *out);
 void siphon_snapshot_free(siphon_snapshot *snapshot);
 #ifdef __cplusplus
 }

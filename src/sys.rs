@@ -30,6 +30,7 @@ pub struct Following {
     _private: [u8; 0],
 }
 #[repr(C)]
+#[derive(Debug)]
 pub struct Snapshot {
     _private: [u8; 0],
 }
@@ -110,6 +111,7 @@ pub struct DirectoryView {
     pub annotations: NamedSlice,
     pub created_seq: u64,
     pub changed_seq: u64,
+    pub removing: u8,
 }
 #[repr(C)]
 pub struct EntryView {
@@ -429,6 +431,15 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_command_screen_text(command: *const Command, out: *mut Buffer) -> Status;
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
+    pub fn siphon_changes_is_empty(changes: *const Changes) -> u8;
+    pub fn siphon_changes_extend(changes: *mut Changes, other: *mut Changes) -> Status;
+    pub fn siphon_changes_rename(changes: *mut Changes, from: Slice, to: Slice) -> Status;
+    pub fn siphon_changes_limit(
+        changes: *mut Changes,
+        process: Slice,
+        counter: Slice,
+        maximum: u64,
+    ) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;
     pub fn siphon_changes_meta(
@@ -517,6 +528,18 @@ unsafe extern "C" {
         context: *mut c_void,
         visit: Option<FiberVisitor>,
     ) -> Status;
+    pub fn siphon_snapshot_fibers(
+        snapshot: *const Snapshot,
+        parent: Slice,
+        kind: Slice,
+        context: *mut c_void,
+        visit: Option<unsafe extern "C" fn(*mut c_void, Slice)>,
+    ) -> Status;
+    pub fn siphon_snapshot_has_requests(
+        snapshot: *const Snapshot,
+        under: Slice,
+        out: *mut u8,
+    ) -> Status;
     pub fn siphon_snapshot_free(snapshot: *mut Snapshot);
     pub fn siphon_run_info(
         run: *const Run,
@@ -527,12 +550,8 @@ unsafe extern "C" {
     pub fn siphon_run_new_id(run: *const Run, out: *mut Buffer) -> Status;
     pub fn siphon_run_changes(run: *mut Run) -> *mut Changes;
     pub fn siphon_run_snapshot(run: *const Run) -> *const Snapshot;
-    pub fn siphon_run_request(
-        run: *mut Run,
-        name: Slice,
-        payload: Slice,
-        key: *mut Buffer,
-    ) -> Status;
+    pub fn siphon_run_request(run: *mut Run, key: Slice, name: Slice, payload: Slice) -> Status;
+    pub fn siphon_run_cancel_request(run: *mut Run, key: Slice) -> Status;
     pub fn siphon_run_answer(
         run: *const Run,
         key: Slice,
