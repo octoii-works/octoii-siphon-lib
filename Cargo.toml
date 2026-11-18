@@ -7,7 +7,7 @@ license = "MIT"
 description = "Safe Rust interface to Siphon's native execution library"
 repository = "https://github.com/octoii-works/octoii-siphon-lib"
 links = "siphon_native"
-publish = false
+include = ["/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md", "/artifacts.json", "/build.rs", "/include/siphon.h", "/src/"]
 
 [dependencies]
 anyhow = "1.0.104"

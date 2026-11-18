@@ -39,6 +39,15 @@ fn main() {
         "Siphon target mismatch"
     );
     assert_eq!(manifest["abi"].as_u64(), Some(4), "Siphon ABI mismatch");
+    let pins: serde_json::Value = serde_json::from_str(include_str!("artifacts.json"))
+        .expect("parse the published artifact checksums");
+    assert_eq!(
+        pins.get(target.as_str()),
+        Some(&manifest),
+        "the native distribution does not match octoii-siphon-lib {}",
+        env!("CARGO_PKG_VERSION"),
+    );
+
     if target.ends_with("windows-msvc") {
         let library = verify_file(&directory, "siphon_native.lib", &manifest["sha256"]);
         let runtime = verify_file(&directory, "siphon_ffi.dll", &manifest["dll_sha256"]);
