@@ -121,6 +121,25 @@ pub struct JournalView {
     pub latest: u64,
     pub missed: u8,
 }
+#[repr(C)]
+pub struct CounterView {
+    pub name: Slice,
+    pub amount: u64,
+}
+#[repr(C)]
+pub struct FiberRecordView {
+    pub kind: Slice,
+    pub version: u32,
+    pub created_seq: u64,
+    pub waits_until: *const i64,
+    pub usage: *const CounterView,
+    pub usage_len: usize,
+    pub reapable: u8,
+    pub outcome: u32,
+    pub payload: Slice,
+    pub reason: Slice,
+}
+type FiberVisitor = unsafe extern "C" fn(*mut c_void, *const FiberRecordView);
 type JournalVisitor = unsafe extern "C" fn(*mut c_void, *const JournalView);
 type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
 type FoundVisitor = unsafe extern "C" fn(*mut c_void, Slice, Slice, *const EntryView);
@@ -258,12 +277,11 @@ unsafe extern "C" {
         context: *mut c_void,
         visit: Option<JournalVisitor>,
     ) -> Status;
-    pub fn siphon_snapshot_outcome(
+    pub fn siphon_snapshot_fiber(
         snapshot: *const Snapshot,
         process: Slice,
-        kind: *mut u32,
-        payload: *mut Buffer,
-        reason: *mut Buffer,
+        context: *mut c_void,
+        visit: Option<FiberVisitor>,
     ) -> Status;
     pub fn siphon_snapshot_free(snapshot: *mut Snapshot);
     pub fn siphon_run_info(

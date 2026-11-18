@@ -63,10 +63,27 @@ typedef struct {
     uint64_t latest;
     uint8_t missed;
 } siphon_journal_view;
+typedef struct {
+    siphon_slice name;
+    uint64_t amount;
+} siphon_counter_view;
+typedef struct {
+    siphon_slice kind;
+    uint32_t version;
+    uint64_t created_seq;
+    const int64_t *waits_until;
+    const siphon_counter_view *usage;
+    size_t usage_len;
+    uint8_t reapable;
+    uint32_t outcome;
+    siphon_slice payload;
+    siphon_slice reason;
+} siphon_fiber_record_view;
 typedef void (*siphon_entry_visitor)(void *context, const siphon_entry_view *entry);
 typedef void (*siphon_found_visitor)(void *context, siphon_slice path, siphon_slice value,
     const siphon_entry_view *entry);
 typedef void (*siphon_journal_visitor)(void *context, const siphon_journal_view *page);
+typedef void (*siphon_fiber_visitor)(void *context, const siphon_fiber_record_view *record);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
@@ -179,9 +196,12 @@ siphon_status siphon_snapshot_seq(const siphon_snapshot *snapshot, uint64_t *out
  */
 siphon_status siphon_snapshot_journal(const siphon_snapshot *snapshot, uint64_t after, size_t limit,
     void *context, siphon_journal_visitor visit);
-/* Missing process returns status 1; absent payloads and reasons are empty buffers. */
-siphon_status siphon_snapshot_outcome(const siphon_snapshot *snapshot, siphon_slice process, uint32_t *kind,
-    siphon_buffer *payload, siphon_buffer *reason);
+/* A missing Fiber returns status 1. The synchronous visitor borrows the record and all its fields.
+ * It must not unwind or free the snapshot. Waits_until is null or a Unix timestamp in milliseconds.
+ * Optional byte slices are null when absent. An outcome can be available before the Fiber is reapable.
+ */
+siphon_status siphon_snapshot_fiber(const siphon_snapshot *snapshot, siphon_slice process, void *context,
+    siphon_fiber_visitor visit);
 void siphon_snapshot_free(siphon_snapshot *snapshot);
 #ifdef __cplusplus
 }

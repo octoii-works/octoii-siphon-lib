@@ -28,9 +28,12 @@ fn until(runtime: &Runtime, ready: impl Fn(&Snapshot) -> bool) -> Snapshot {
     }
 }
 
-fn finished<P: Fiber>(runtime: &Runtime, path: &[u8]) -> Snapshot {
+fn finished(runtime: &Runtime, path: &[u8]) -> Snapshot {
     until(runtime, |snapshot| {
-        !matches!(snapshot.outcome::<P>(path).unwrap(), Some(Outcome::Pending))
+        snapshot
+            .fiber(path)
+            .unwrap()
+            .is_some_and(|record| record.reapable)
     })
 }
 
@@ -59,6 +62,11 @@ impl Fiber for Parent {
         assert_eq!(run.path(), process_path(b"", b"parent")?);
         assert!(run.time_ms() > 0 && run.sequence()? > 0);
         assert!(!run.is_stop_handler());
+        let record = run.fiber(run.path())?.unwrap();
+        assert_eq!(record.kind, Self::KIND.as_bytes());
+        assert_eq!(record.version, Self::VERSION);
+        assert!(!record.reapable);
+        assert_eq!(record.outcome, Outcome::Pending);
         let gate = Query {
             kind: b"gate",
             name: b"state",
@@ -104,7 +112,10 @@ impl Fiber for Parent {
                 assert_eq!(page, Some(Vec::new()));
                 assert_eq!(run.read_range(b"log", 1, 2)?, Some(b"ex".to_vec()));
                 run.append(b"log", b" change")?;
-                Ok(Ending::Wait(value + 1, Wait::new().change(b"gate")))
+                Ok(Ending::Wait(
+                    value + 1,
+                    Wait::new().change(b"gate").deadline(run.time_ms() + 60_000),
+                ))
             }
             Some(value) if value == start + 1 => {
                 assert_eq!(run.read(b"gate/signal")?, Some(b"go".to_vec()));
@@ -175,13 +186,19 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
         waiting.outcome::<Parent>(&path).unwrap(),
         Some(Outcome::Pending)
     );
+    let record = waiting.fiber(&path).unwrap().unwrap();
+    assert_eq!(record.kind, Parent::KIND.as_bytes());
+    assert_eq!(record.version, Parent::VERSION);
+    assert!(record.waits_until.is_some_and(|deadline| deadline > 0));
+    assert!(!record.reapable);
+    assert_eq!(waiting.outcome::<Child>(&path).unwrap_err().code, 2);
     let mut wake = Changes::new().unwrap();
     wake.write(b"gate/signal", b"go").unwrap();
     runtime.commit(&wake).unwrap();
 
     let completed = Some(Outcome::Completed(Some(("answer".into(), 45))));
     let log = Some(b"next change child deadline done".to_vec());
-    let finished = finished::<Parent>(&runtime, &path);
+    let finished = finished(&runtime, &path);
     assert_eq!(finished.outcome::<Parent>(&path).unwrap(), completed);
     assert_eq!(finished.read(b"log").unwrap(), log);
     assert_eq!(finished.read(b"gate/signal").unwrap(), None);
@@ -193,6 +210,71 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     let snapshot = reopened.snapshot().unwrap();
     assert_eq!(snapshot.outcome::<Parent>(&path).unwrap(), completed);
     assert_eq!(snapshot.read(b"log").unwrap(), log);
+}
+
+struct ExitsFirst;
+
+impl Fiber for ExitsFirst {
+    const KIND: &'static str = "contract.exits-first";
+    type Input = ();
+    type Checkpoint = ();
+    type Output = ();
+
+    fn run(&self, run: &mut Run<'_>, (): (), _: Option<()>) -> Result<Ending<(), ()>> {
+        let parent = run.path().to_vec();
+        run.mkdir(b"exit-gate")?
+            .start::<WaitsForRelease>(&parent, b"child", &())?;
+        Ok(Ending::Done(()))
+    }
+}
+
+struct WaitsForRelease;
+
+impl Fiber for WaitsForRelease {
+    const KIND: &'static str = "contract.waits-for-release";
+    type Input = ();
+    type Checkpoint = ();
+    type Output = ();
+
+    fn run(&self, run: &mut Run<'_>, (): (), _: Option<()>) -> Result<Ending<(), ()>> {
+        if run.read(b"exit-gate/release")?.is_some() {
+            return Ok(Ending::Done(()));
+        }
+        Ok(Ending::Wait((), Wait::new().change(b"exit-gate")))
+    }
+}
+
+#[test]
+fn a_recorded_outcome_can_precede_reaping_eligibility() {
+    let mut builder = Builder::new().unwrap();
+    builder
+        .fiber(ExitsFirst)
+        .unwrap()
+        .fiber(WaitsForRelease)
+        .unwrap();
+    let runtime = builder.memory().unwrap();
+    let path = start::<ExitsFirst>(&runtime, b"parent", &());
+    let exiting = until(&runtime, |snapshot| {
+        snapshot
+            .fiber(&path)
+            .unwrap()
+            .is_some_and(|record| matches!(record.outcome, Outcome::Completed(_)))
+    });
+    let before = exiting.fiber(&path).unwrap().unwrap();
+    assert!(!before.reapable);
+    assert_eq!(
+        exiting.outcome::<ExitsFirst>(&path).unwrap(),
+        Some(Outcome::Completed(Some(())))
+    );
+
+    let mut wake = Changes::new().unwrap();
+    wake.write(b"exit-gate/release", b"go").unwrap();
+    runtime.commit(&wake).unwrap();
+    let ended = finished(&runtime, &path).fiber(&path).unwrap().unwrap();
+    assert!(ended.reapable);
+    assert_eq!(ended.created_seq, before.created_seq);
+    assert_eq!(ended.outcome, before.outcome);
+    assert_eq!(exiting.fiber(&path).unwrap(), Some(before));
 }
 
 struct Stoppable;
@@ -240,7 +322,7 @@ fn a_waiting_process_preserves_its_stop_handler_result() {
     changes.terminate(&path).unwrap();
     runtime.commit(&changes).unwrap();
 
-    let stopped = finished::<Stoppable>(&runtime, &path);
+    let stopped = finished(&runtime, &path);
     assert_eq!(
         stopped.outcome::<Stoppable>(&path).unwrap(),
         Some(Outcome::Stopped {
@@ -295,7 +377,7 @@ fn explicit_failure_commits_writes_while_errors_and_panics_discard_them() {
         ("panic", "the phase panicked", None),
     ] {
         let path = start::<Fails>(&runtime, kind.as_bytes(), &kind.into());
-        let snapshot = finished::<Fails>(&runtime, &path);
+        let snapshot = finished(&runtime, &path);
         let Some(Outcome::Failed {
             error: Some(error),
             reason: None,

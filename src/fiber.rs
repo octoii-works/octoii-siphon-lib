@@ -10,9 +10,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
 use crate::{
-    Answer, ChangeHandle, Entry, Error, Found, NameChange, Query, Range, Request, Result, Runtime,
-    SnapshotHandle, borrow_slice, check, compatible, discard_panic, handle, panic_message, present,
-    release_context, slice, sys, take,
+    Answer, ChangeHandle, Entry, Error, FiberRecord, Found, NameChange, Query, Range, Request,
+    Result, Runtime, SnapshotHandle, borrow_slice, check, compatible, discard_panic, handle,
+    panic_message, present, release_context, slice, sys, take,
 };
 
 /// Fibers and request handlers to register before opening a runtime.
@@ -279,6 +279,12 @@ impl<'a> Run<'a> {
         self.snapshot.read_range(path, offset, length)
     }
 
+    /// Reads a Fiber record from the immutable snapshot for this phase.
+    pub fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
+        self.snapshot.fiber(process)
+    }
+
+    /// Decodes the outcome for the stated Fiber kind and version.
     pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         self.snapshot.outcome::<P>(process)
     }

@@ -92,6 +92,21 @@ pub struct Journal {
     pub missed: bool,
 }
 
+/// A Fiber's identity, committed result, and current reaping eligibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiberRecord {
+    pub kind: Vec<u8>,
+    pub version: u32,
+    pub created_seq: u64,
+    /// A wait deadline in milliseconds since the Unix epoch, when set.
+    pub waits_until: Option<i64>,
+    pub usage: Vec<(Vec<u8>, u64)>,
+    /// The Fiber has ended and its record can be reaped.
+    pub reapable: bool,
+    /// The recorded outcome. It can be available while descendants are still exiting.
+    pub outcome: Outcome<Vec<u8>>,
+}
+
 #[derive(Debug)]
 pub struct Snapshot(pub(crate) SnapshotHandle);
 // SAFETY: native snapshots are immutable and support concurrent reads.
@@ -128,7 +143,12 @@ impl Snapshot {
     pub fn read_range(&self, path: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         self.0.read_range(path, offset, length)
     }
-    /// Reads the outcome at `process`, returning `None` when the path has no process record.
+    /// Returns the Fiber record at this path, if present.
+    pub fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
+        self.0.fiber(process)
+    }
+
+    /// Decodes the outcome for the stated Fiber kind and version from the same record.
     pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
         self.0.outcome::<P>(process)
     }
@@ -246,44 +266,46 @@ impl SnapshotHandle {
         let data = take(out);
         Ok(present(status)?.then_some(data))
     }
-    pub(crate) fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        let mut kind = sys::OUTCOME_PENDING;
-        let mut payload = sys::Buffer::default();
-        let mut reason = sys::Buffer::default();
-        // SAFETY: snapshot is live, process is readable for the call, outputs are writable.
+    pub(crate) fn fiber(&self, process: &[u8]) -> Result<Option<FiberRecord>> {
+        let mut record: Option<Result<FiberRecord>> = None;
+        // SAFETY: the snapshot and path are live. The visitor writes into record exclusively.
         let status = unsafe {
-            sys::siphon_snapshot_outcome(
+            sys::siphon_snapshot_fiber(
                 self.0.as_ptr(),
                 slice(process),
-                &mut kind,
-                &mut payload,
-                &mut reason,
+                ptr::from_mut(&mut record).cast(),
+                Some(collect_fiber),
             )
         };
-        let payload = take(payload);
-        let reason = take(reason);
         if !present(status)? {
             return Ok(None);
         }
-        let payload = (!payload.is_empty()).then_some(payload);
-        let reason = (!reason.is_empty()).then_some(reason);
-        let outcome = match kind {
-            sys::OUTCOME_PENDING => Outcome::Pending,
-            sys::OUTCOME_COMPLETED => Outcome::Completed(decode(payload.as_deref())?),
-            sys::OUTCOME_FAILED => Outcome::Failed {
-                error: payload,
+        record
+            .ok_or_else(|| Error {
+                code: 4,
+                message: "Siphon returned no record for a successful Fiber read".into(),
+            })?
+            .map(Some)
+    }
+
+    pub(crate) fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
+        let Some(record) = self.fiber(process)? else {
+            return Ok(None);
+        };
+        if record.kind != P::KIND.as_bytes() || record.version != P::VERSION {
+            return Err(Error {
+                code: 2,
+                message: "the Fiber at this path has a different kind or version".into(),
+            });
+        }
+        let outcome = match record.outcome {
+            Outcome::Pending => Outcome::Pending,
+            Outcome::Completed(result) => Outcome::Completed(decode(result.as_deref())?),
+            Outcome::Failed { error, reason } => Outcome::Failed { error, reason },
+            Outcome::Stopped { result, reason } => Outcome::Stopped {
+                result: decode(result.as_deref())?,
                 reason,
             },
-            sys::OUTCOME_STOPPED => Outcome::Stopped {
-                result: decode(payload.as_deref())?,
-                reason,
-            },
-            _ => {
-                return Err(Error {
-                    code: 4,
-                    message: format!("library returned an unknown outcome kind: {kind}"),
-                });
-            }
         };
         Ok(Some(outcome))
     }
@@ -381,6 +403,62 @@ unsafe extern "C" fn collect_journal(context: *mut c_void, view: *const sys::Jou
         latest: view.latest,
         missed: view.missed != 0,
     });
+}
+
+/// Safety: a present slice must remain readable for this copy.
+unsafe fn copy_optional(value: sys::Slice) -> Option<Vec<u8>> {
+    // SAFETY: the native record keeps present byte slices readable during the visit.
+    (!value.data.is_null()).then(|| unsafe { borrow_slice(value) }.to_vec())
+}
+
+/// Safety: the native record and its fields must remain live for this copy.
+unsafe fn copy_fiber(view: &sys::FiberRecordView) -> Result<FiberRecord> {
+    // SAFETY: the record holds both optional values until the visitor returns.
+    let (payload, reason) = unsafe { (copy_optional(view.payload), copy_optional(view.reason)) };
+    let outcome = match view.outcome {
+        sys::OUTCOME_PENDING => Outcome::Pending,
+        sys::OUTCOME_COMPLETED => Outcome::Completed(payload),
+        sys::OUTCOME_FAILED => Outcome::Failed {
+            error: payload,
+            reason,
+        },
+        sys::OUTCOME_STOPPED => Outcome::Stopped {
+            result: payload,
+            reason,
+        },
+        kind => {
+            return Err(Error {
+                code: 4,
+                message: format!("library returned an unknown outcome kind: {kind}"),
+            });
+        }
+    };
+    // SAFETY: the native visitor keeps the usage array and every name live for this copy.
+    let usage = unsafe { borrow_array(view.usage, view.usage_len) }
+        .iter()
+        .map(|entry| (unsafe { borrow_slice(entry.name) }.to_vec(), entry.amount))
+        .collect();
+    // SAFETY: kind is readable and waits_until is null or borrowed for this visit.
+    let (kind, waits_until) = unsafe {
+        (
+            borrow_slice(view.kind).to_vec(),
+            view.waits_until.as_ref().copied(),
+        )
+    };
+    Ok(FiberRecord {
+        kind,
+        version: view.version,
+        created_seq: view.created_seq,
+        waits_until,
+        usage,
+        reapable: view.reapable != 0,
+        outcome,
+    })
+}
+
+unsafe extern "C" fn collect_fiber(context: *mut c_void, view: *const sys::FiberRecordView) {
+    // SAFETY: the wrapper supplies an exclusive slot and the library lends a live record.
+    unsafe { *context.cast::<Option<Result<FiberRecord>>>() = Some(copy_fiber(&*view)) };
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option<T>> {
