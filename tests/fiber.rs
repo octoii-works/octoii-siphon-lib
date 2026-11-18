@@ -212,6 +212,52 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     assert_eq!(snapshot.read(b"log").unwrap(), log);
 }
 
+struct VolumeIds;
+
+impl Fiber for VolumeIds {
+    const KIND: &'static str = "contract.volume-ids";
+    type Input = ();
+    type Checkpoint = ();
+    type Output = (String, i64);
+
+    fn run(&self, run: &mut Run<'_>, (): (), _: Option<()>) -> Result<Ending<(), Self::Output>> {
+        let id = run.new_id()?;
+        let deadline = run.time_ms() + 60_000;
+        run.write(b"phase-id", id.as_bytes())?
+            .seal(b"phase-id")?
+            .expire(b"phase-id", Some(deadline))?;
+        Ok(Ending::Done((id, deadline)))
+    }
+}
+
+#[test]
+fn a_phase_and_its_runtime_allocate_from_the_same_volume() {
+    let mut builder = Builder::new().unwrap();
+    builder.fiber(VolumeIds).unwrap();
+    let runtime = builder.memory().unwrap();
+    let before = runtime.new_id().unwrap();
+    let path = start::<VolumeIds>(&runtime, b"work", &());
+    let snapshot = finished(&runtime, &path);
+    let Some(Outcome::Completed(Some((id, deadline)))) =
+        snapshot.outcome::<VolumeIds>(&path).unwrap()
+    else {
+        panic!("the phase returned its ID and deadline")
+    };
+    let after = runtime.new_id().unwrap();
+    assert!(before < id && id < after);
+    assert_eq!(
+        snapshot.read(b"phase-id").unwrap().as_deref(),
+        Some(id.as_bytes())
+    );
+    assert_eq!(
+        snapshot.stat(b"phase-id").unwrap().unwrap().expires_at,
+        Some(deadline)
+    );
+    let mut append = Changes::new().unwrap();
+    append.append(b"phase-id", b"forbidden").unwrap();
+    assert!(runtime.commit(&append).is_err());
+}
+
 struct ExitsFirst;
 
 impl Fiber for ExitsFirst {
@@ -457,6 +503,8 @@ impl Fiber for CallbackOwner {
         let open = Runtime::memory().unwrap_err().code;
         let commit = runtime.commit(&Changes::new()?).unwrap_err().code;
         let snapshot = runtime.snapshot().unwrap_err().code;
+        assert_eq!(runtime.new_id().unwrap_err().code, 6);
+        assert_eq!(runtime.now_ms().unwrap_err().code, 6);
         let close = runtime.close().unwrap_err().code;
         drop(runtime);
         self.report.send((open, commit, snapshot, close)).unwrap();

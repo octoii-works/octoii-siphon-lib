@@ -248,6 +248,14 @@ impl<'a> Run<'a> {
         self.time_ms
     }
 
+    /// Mints a UUIDv7 from the same volume as the runtime.
+    pub fn new_id(&self) -> Result<String> {
+        let mut out = sys::Buffer::default();
+        // SAFETY: this phase is live and out is writable.
+        let status = unsafe { sys::siphon_run_new_id(self.phase.as_ptr(), &mut out) };
+        crate::decode_id(status, out)
+    }
+
     pub fn is_stop_handler(&self) -> bool {
         self.stop_handler
     }
@@ -378,6 +386,16 @@ impl<'a> Run<'a> {
         Ok(self)
     }
 
+    /// Stages sealing a file in this phase.
+    pub fn seal(&mut self, path: &[u8]) -> Result<&mut Self> {
+        self.changes.seal(path)?;
+        Ok(self)
+    }
+    /// Stages expiration in milliseconds since the Unix epoch. None clears it.
+    pub fn expire(&mut self, path: &[u8], deadline: Option<i64>) -> Result<&mut Self> {
+        self.changes.expire(path, deadline)?;
+        Ok(self)
+    }
     pub fn delete(&mut self, path: &[u8]) -> Result<&mut Self> {
         self.changes.delete(path)?;
         Ok(self)

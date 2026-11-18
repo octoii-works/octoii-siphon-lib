@@ -297,6 +297,69 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
 }
 
 #[test]
+fn volume_ids_and_file_retention_survive_reopening() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut runtime = Runtime::open(directory.path()).unwrap();
+    let first = runtime.new_id().unwrap();
+    assert_eq!(first.len(), 36);
+    assert_eq!(first.as_bytes()[14], b'7');
+    let now = runtime.now_ms().unwrap();
+    assert!(now > 0);
+    let deadline = now + 60_000;
+
+    let mut changes = Changes::new().unwrap();
+    changes
+        .write(b"log", b"first")
+        .unwrap()
+        .seal(b"log")
+        .unwrap()
+        .expire(b"log", Some(deadline))
+        .unwrap();
+    runtime.commit(&changes).unwrap();
+    let before = runtime.snapshot().unwrap();
+    assert_eq!(
+        before.stat(b"log").unwrap().unwrap().expires_at,
+        Some(deadline)
+    );
+
+    let mut blocked = Changes::new().unwrap();
+    blocked.append(b"log", b"later").unwrap();
+    assert_eq!(runtime.commit(&blocked).unwrap_err().code, 4);
+    let mut clear = Changes::new().unwrap();
+    clear.expire(b"log", None).unwrap();
+    runtime.commit(&clear).unwrap();
+    let after = runtime.snapshot().unwrap();
+    assert_eq!(
+        before.stat(b"log").unwrap().unwrap().expires_at,
+        Some(deadline)
+    );
+    assert_eq!(after.stat(b"log").unwrap().unwrap().expires_at, None);
+    assert_eq!(
+        after.read(b"log").unwrap().as_deref(),
+        Some(b"first".as_slice())
+    );
+
+    runtime.close().unwrap();
+    assert_eq!(runtime.new_id().unwrap_err().code, 3);
+    assert_eq!(runtime.now_ms().unwrap_err().code, 3);
+    drop((before, after, runtime));
+
+    let reopened = Runtime::open(directory.path()).unwrap();
+    assert!(reopened.new_id().unwrap() > first);
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .stat(b"log")
+            .unwrap()
+            .unwrap()
+            .expires_at,
+        None
+    );
+    assert_eq!(reopened.commit(&blocked).unwrap_err().code, 4);
+}
+
+#[test]
 fn a_failed_batch_does_not_commit_earlier_writes() {
     let runtime = Runtime::memory().unwrap();
     let mut batch = Changes::new().unwrap();

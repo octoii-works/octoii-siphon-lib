@@ -110,6 +110,14 @@ fn check(status: sys::Status) -> Result<()> {
         })
     }
 }
+fn decode_id(status: sys::Status, buffer: sys::Buffer) -> Result<String> {
+    let id = take(buffer);
+    check(status)?;
+    String::from_utf8(id).map_err(|error| Error {
+        code: 4,
+        message: format!("Siphon returned an invalid ID: {error}"),
+    })
+}
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
     if unsafe { sys::siphon_abi_version() } == 4 {
@@ -166,6 +174,22 @@ impl Runtime {
         check(unsafe { sys::siphon_runtime_snapshot(self.0.as_ptr(), &mut out) })?;
         Ok(Snapshot(SnapshotHandle(handle(out)?)))
     }
+    /// Mints a UUIDv7 from this volume.
+    pub fn new_id(&self) -> Result<String> {
+        let mut out = sys::Buffer::default();
+        // SAFETY: the runtime is live and out is writable.
+        let status = unsafe { sys::siphon_runtime_new_id(self.0.as_ptr(), &mut out) };
+        decode_id(status, out)
+    }
+
+    /// Reads the runtime clock in milliseconds since the Unix epoch.
+    pub fn now_ms(&self) -> Result<i64> {
+        let mut now = 0;
+        // SAFETY: the runtime is live and now is writable.
+        check(unsafe { sys::siphon_runtime_now_ms(self.0.as_ptr(), &mut now) })?;
+        Ok(now)
+    }
+
     /// Stops execution. Retained snapshots remain readable and may retain the storage lock.
     pub fn close(&mut self) -> Result<()> {
         // SAFETY: runtime is exclusively borrowed and remains allocated until Drop.
@@ -219,6 +243,16 @@ impl Changes {
     }
     pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<&mut Self> {
         self.0.append(path, data)?;
+        Ok(self)
+    }
+    /// Stages sealing a file in the batch.
+    pub fn seal(&mut self, path: &[u8]) -> Result<&mut Self> {
+        self.0.seal(path)?;
+        Ok(self)
+    }
+    /// Stages expiration in milliseconds since the Unix epoch. None clears it.
+    pub fn expire(&mut self, path: &[u8], deadline: Option<i64>) -> Result<&mut Self> {
+        self.0.expire(path, deadline)?;
         Ok(self)
     }
     pub fn delete(&mut self, path: &[u8]) -> Result<&mut Self> {
@@ -290,6 +324,17 @@ impl ChangeHandle {
     fn append(&mut self, path: &[u8], data: &[u8]) -> Result<()> {
         // SAFETY: batch is exclusively borrowed, slices live for the call.
         check(unsafe { sys::siphon_changes_append(self.0.as_ptr(), slice(path), slice(data)) })
+    }
+    fn seal(&mut self, path: &[u8]) -> Result<()> {
+        // SAFETY: the batch is exclusively borrowed and path is readable.
+        check(unsafe { sys::siphon_changes_seal(self.0.as_ptr(), slice(path)) })
+    }
+    fn expire(&mut self, path: &[u8], deadline: Option<i64>) -> Result<()> {
+        let at = deadline
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the batch is exclusively borrowed. Path and the optional deadline are live.
+        check(unsafe { sys::siphon_changes_expire(self.0.as_ptr(), slice(path), at) })
     }
     fn delete(&mut self, path: &[u8]) -> Result<()> {
         // SAFETY: batch is exclusively borrowed, path lives for the call.

@@ -221,6 +221,8 @@ unsafe extern "C" {
         seq: *mut u64,
     ) -> Status;
     pub fn siphon_runtime_snapshot(runtime: *const Runtime, out: *mut *mut Snapshot) -> Status;
+    pub fn siphon_runtime_new_id(runtime: *const Runtime, out: *mut Buffer) -> Status;
+    pub fn siphon_runtime_now_ms(runtime: *const Runtime, out: *mut i64) -> Status;
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;
@@ -232,6 +234,12 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_changes_write(changes: *mut Changes, path: Slice, data: Slice) -> Status;
     pub fn siphon_changes_append(changes: *mut Changes, path: Slice, data: Slice) -> Status;
+    pub fn siphon_changes_seal(changes: *mut Changes, path: Slice) -> Status;
+    pub fn siphon_changes_expire(
+        changes: *mut Changes,
+        path: Slice,
+        deadline: *const i64,
+    ) -> Status;
     pub fn siphon_changes_delete(changes: *mut Changes, path: Slice) -> Status;
     pub fn siphon_changes_start(
         changes: *mut Changes,
@@ -290,6 +298,7 @@ unsafe extern "C" {
         time_ms: *mut i64,
         stop_handler: *mut u8,
     ) -> Status;
+    pub fn siphon_run_new_id(run: *const Run, out: *mut Buffer) -> Status;
     pub fn siphon_run_changes(run: *mut Run) -> *mut Changes;
     pub fn siphon_run_snapshot(run: *const Run) -> *const Snapshot;
     pub fn siphon_run_request(

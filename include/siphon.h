@@ -126,13 +126,16 @@ siphon_status siphon_builder_handle_request(siphon_builder *builder, siphon_slic
  * Restored phases may invoke their callbacks before this call returns the runtime handle.
  */
 siphon_status siphon_builder_open(siphon_builder *builder, siphon_slice directory, siphon_runtime **out);
-/* Runtime open, explicit close, commit, and snapshot return status 6 from a callback.
+/* Runtime open, explicit close, commit, snapshot, ID and clock calls return status 6 from a callback.
  * Free in that context releases the handle immediately and the runtime shuts down asynchronously.
  */
 siphon_status siphon_runtime_close(const siphon_runtime *runtime);
 siphon_status siphon_runtime_free(siphon_runtime *runtime);
 siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, uint64_t *seq);
 siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snapshot **out);
+/* IDs are UTF-8 UUIDv7 values from the volume. Free the buffer with siphon_buffer_free. */
+siphon_status siphon_runtime_new_id(const siphon_runtime *runtime, siphon_buffer *out);
+siphon_status siphon_runtime_now_ms(const siphon_runtime *runtime, int64_t *out);
 siphon_status siphon_changes_new(siphon_changes **out);
 void siphon_changes_free(siphon_changes *changes);
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);
@@ -143,12 +146,17 @@ siphon_status siphon_changes_meta(siphon_changes *changes, siphon_slice path, si
     siphon_named_slice annotations);
 siphon_status siphon_changes_write(siphon_changes *changes, siphon_slice path, siphon_slice data);
 siphon_status siphon_changes_append(siphon_changes *changes, siphon_slice path, siphon_slice data);
+siphon_status siphon_changes_seal(siphon_changes *changes, siphon_slice path);
+/* Deadline is in milliseconds since the Unix epoch. Null clears expiration. */
+siphon_status siphon_changes_expire(siphon_changes *changes, siphon_slice path, const int64_t *deadline);
 siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
 siphon_status siphon_process_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
 siphon_status siphon_changes_start(siphon_changes *changes, siphon_slice parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
 siphon_status siphon_changes_terminate(siphon_changes *changes, siphon_slice process);
 siphon_status siphon_run_info(const siphon_run *run, siphon_slice *path, int64_t *time_ms, uint8_t *stop_handler);
+/* Allocates from the same volume inside the phase. Free the buffer with siphon_buffer_free. */
+siphon_status siphon_run_new_id(const siphon_run *run, siphon_buffer *out);
 /* Borrowed for this callback. Do not free, send to other threads, or separately commit. */
 siphon_changes *siphon_run_changes(siphon_run *run);
 const siphon_snapshot *siphon_run_snapshot(const siphon_run *run);
