@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::watch;
 
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
-pub use request::{Answer, Asked, Request, Unanswered};
+pub use request::{Answer, Asked, Request, RequestId, Unanswered};
 use snapshot::SnapshotHandle;
 pub use snapshot::{
     ChangeSet, Directory, Entry, FiberRecord, Found, Journal, Query, Range, Snapshot,

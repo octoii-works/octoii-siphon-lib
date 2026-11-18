@@ -21,14 +21,24 @@ pub trait Request: Serialize + DeserializeOwned + Send + 'static {
     type Answer: Serialize + DeserializeOwned + Send + 'static;
 }
 
+/// The durable identity of one request in a volume.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestId {
+    /// The requesting Fiber's path.
+    pub process: Vec<u8>,
+    /// The Fiber's creation sequence.
+    pub started: u64,
+    /// The request's mailbox key.
+    pub key: Vec<u8>,
+    /// The request's creation sequence.
+    pub created_seq: u64,
+}
+
 /// A delivered request passed to its host handler.
 #[derive(Debug)]
 pub struct Asked<R> {
+    pub id: RequestId,
     pub payload: R,
-    /// The requesting process's path in the volume.
-    pub process: Vec<u8>,
-    /// The Siphon-generated mailbox key.
-    pub key: String,
     /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
     pub cancelled: CancellationToken,
 }
@@ -129,8 +139,7 @@ impl Drop for Reply {
 
 unsafe extern "C" fn deliver<R, F, A>(
     context: *mut c_void,
-    process: sys::Slice,
-    key: sys::Slice,
+    id: *const sys::RequestId,
     payload: sys::Slice,
     reply: *mut sys::Reply,
 ) -> sys::Watch
@@ -143,12 +152,15 @@ where
     let started = catch_unwind(AssertUnwindSafe(move || {
         // SAFETY: native keeps its registration and slices live throughout the callback.
         let registration = unsafe { &*context.cast::<Registration<F>>() };
-        let (process, key, payload) = unsafe {
-            (
-                borrow_slice(process).to_vec(),
-                borrow_slice(key).to_vec(),
-                borrow_slice(payload).to_vec(),
-            )
+        let (id, payload) = unsafe {
+            let id = &*id;
+            let owned = RequestId {
+                process: borrow_slice(id.process).to_vec(),
+                started: id.started,
+                key: borrow_slice(id.key).to_vec(),
+                created_seq: id.created_seq,
+            };
+            (owned, borrow_slice(payload).to_vec())
         };
         let cancelled = CancellationToken::new();
         let signal = cancelled.clone();
@@ -158,13 +170,9 @@ where
                 let payload = serde_json::from_slice(&payload).map_err(|error| {
                     Unanswered::Failed(format!("the request could not be read: {error}"))
                 })?;
-                let key = String::from_utf8(key).map_err(|error| {
-                    Unanswered::Failed(format!("the request key could not be read: {error}"))
-                })?;
                 let given = handler(Asked {
+                    id,
                     payload,
-                    process,
-                    key,
                     cancelled: signal,
                 })
                 .await?;

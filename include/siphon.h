@@ -94,13 +94,19 @@ typedef void (*siphon_fiber_visitor)(void *context, const siphon_fiber_record_vi
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
 typedef void (*siphon_commit_callback)(void *context, uint64_t seq);
+typedef struct {
+    siphon_slice process;
+    uint64_t started; /* Fiber creation sequence. */
+    siphon_slice key;
+    uint64_t created_seq; /* Request creation sequence. */
+} siphon_request_id;
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
 typedef struct {
     void *context;
     siphon_request_notify notify;
     siphon_release_callback release;
 } siphon_request_watch;
-typedef siphon_request_watch (*siphon_request_deliver)(void *context, siphon_slice process, siphon_slice key,
+typedef siphon_request_watch (*siphon_request_deliver)(void *context, const siphon_request_id *id,
     siphon_slice payload, siphon_reply *reply);
 enum {
     SIPHON_END_NEXT = 1, SIPHON_END_WAIT, SIPHON_END_DONE, SIPHON_END_FAIL, SIPHON_END_STOPPED, SIPHON_END_THROW
@@ -126,7 +132,8 @@ void siphon_builder_free(siphon_builder *builder);
 siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, uint32_t version, uint8_t stop_handler,
     uint32_t retries, int64_t delay_min_ms, int64_t delay_max_ms, void *context, siphon_phase_callback run, siphon_release_callback release);
 /* With release, context transfers even on registration error. Keep context ready before open and
- * thread-safe for concurrent deliveries. Copy the borrowed slices and transfer reply to host work.
+ * thread-safe for concurrent deliveries. The identity and its byte slices and the payload are valid
+ * only during delivery. Copy any data needed by host work and transfer reply to it.
  * Each call owns reply, even if it declines to handle the request. It may return an empty watch.
  * The watch transfers its context to Siphon if release is supplied. Stop allows an answer; Closed
  * means no more answers are accepted, not that an earlier answer committed. Siphon then releases

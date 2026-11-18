@@ -158,9 +158,7 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             assert_eq!(thread::current().name(), Some("siphon-request-host"));
-            deliveries
-                .send((asked.key, asked.process, asked.payload.0))
-                .unwrap();
+            deliveries.send((asked.id, asked.payload.0)).unwrap();
             ready(Ok(asked.payload.0 * 2))
         })
         .unwrap();
@@ -171,19 +169,21 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
         Outcome::Failed { .. }
     ));
     let process = start::<Twice>(&runtime, b"twice", &21);
-    let (first_key, first_process, first_input) = received.recv_timeout(TIMEOUT).unwrap();
-    let (second_key, second_process, second_input) = received.recv_timeout(TIMEOUT).unwrap();
-    assert_ne!(first_key, second_key);
-    assert_eq!(
-        (first_process, second_process),
-        (process.clone(), process.clone())
-    );
+    let (first, first_input) = received.recv_timeout(TIMEOUT).unwrap();
+    let (second, second_input) = received.recv_timeout(TIMEOUT).unwrap();
+    assert_ne!(first.key, second.key);
+    assert_eq!(first.process, process);
+    assert_eq!(second.process, process);
     assert_eq!((first_input, second_input), (21, 42));
     assert_eq!(
         finish::<Twice>(&runtime, &process),
         Outcome::Completed(Some((42, 84)))
     );
     let snapshot = runtime.snapshot().unwrap();
+    let created = snapshot.fiber(&process).unwrap().unwrap().created_seq;
+    assert_eq!((first.started, second.started), (created, created));
+    assert!(created < first.created_seq && first.created_seq < second.created_seq);
+    assert!(second.created_seq <= snapshot.sequence().unwrap());
     assert_eq!(
         snapshot.read(b"answers").unwrap().as_deref(),
         Some(b"42, 84".as_slice())
@@ -258,7 +258,7 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             let started = started.clone();
             async move {
-                started.send((asked.process, asked.key)).unwrap();
+                started.send(asked.id).unwrap();
                 asked.cancelled.cancelled().await;
                 Ok(asked.payload.0)
             }
@@ -266,14 +266,14 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         .unwrap();
     let runtime = builder.memory().unwrap();
     let process = start::<Once>(&runtime, b"stop", &42);
-    let (asked_process, key) = running.recv_timeout(TIMEOUT).unwrap();
-    assert_eq!(asked_process, process);
+    let request = running.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(request.process, process);
     let mut conflicting = Changes::new().unwrap();
     conflicting
         .send(
             &process,
             &Mail {
-                key: key.into_bytes(),
+                key: request.key,
                 name: b"ordinary".to_vec(),
                 payload: b"reserved".to_vec(),
             },

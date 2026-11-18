@@ -157,6 +157,14 @@ type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
 type FoundVisitor = unsafe extern "C" fn(*mut c_void, Slice, Slice, *const EntryView);
 
 #[repr(C)]
+pub struct RequestId {
+    pub process: Slice,
+    pub started: u64,
+    pub key: Slice,
+    pub created_seq: u64,
+}
+
+#[repr(C)]
 pub struct Watch {
     pub context: *mut c_void,
     pub notify: Option<NotifyCallback>,
@@ -195,7 +203,8 @@ type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, Slice, Slice);
 type ReleaseCallback = unsafe extern "C" fn(*mut c_void);
 type CommitCallback = unsafe extern "C" fn(*mut c_void, u64);
 type NotifyCallback = unsafe extern "C" fn(*mut c_void, u32);
-type DeliverCallback = unsafe extern "C" fn(*mut c_void, Slice, Slice, Slice, *mut Reply) -> Watch;
+type DeliverCallback =
+    unsafe extern "C" fn(*mut c_void, *const RequestId, Slice, *mut Reply) -> Watch;
 
 unsafe extern "C" {
     pub fn siphon_abi_version() -> u32;
