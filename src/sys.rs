@@ -14,6 +14,10 @@ pub struct CommitWatch {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct Namespace {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Following {
     _private: [u8; 0],
 }
@@ -184,6 +188,17 @@ pub struct PersonRequestView {
     pub payload: Slice,
     pub answer_schema: Slice,
 }
+#[repr(C)]
+pub struct FileStat {
+    pub kind: u32,
+    pub executable: u8,
+    pub size: u64,
+    pub modified_ms: i64,
+    pub file_id: *const u64,
+}
+type FileVisitor = unsafe extern "C" fn(*mut c_void, *const FileStat);
+type DirentVisitor = unsafe extern "C" fn(*mut c_void, Slice, u32);
+
 type PersonVisitor = unsafe extern "C" fn(*mut c_void, *const PersonRequestView);
 
 #[repr(C)]
@@ -323,6 +338,46 @@ unsafe extern "C" {
         out: *mut *mut CommitWatch,
     ) -> Status;
     pub fn siphon_commit_watch_free(watch: *mut CommitWatch);
+    pub fn siphon_namespace_new(out: *mut *mut Namespace) -> Status;
+    pub fn siphon_namespace_free(namespace: *mut Namespace);
+    pub fn siphon_namespace_mount_host(
+        namespace: *const Namespace,
+        at: Slice,
+        host: Slice,
+        writable: u8,
+    ) -> Status;
+    pub fn siphon_namespace_hide(namespace: *const Namespace, at: Slice) -> Status;
+    pub fn siphon_namespace_mount_labels(
+        namespace: *const Namespace,
+        runtime: *const Runtime,
+        at: Slice,
+        kind: Slice,
+        label: Slice,
+        under: Slice,
+    ) -> Status;
+    pub fn siphon_namespace_stat(
+        namespace: *const Namespace,
+        path: Slice,
+        context: *mut c_void,
+        visit: Option<FileVisitor>,
+    ) -> Status;
+    pub fn siphon_namespace_list(
+        namespace: *const Namespace,
+        path: Slice,
+        range: SnapshotRange,
+        context: *mut c_void,
+        visit: Option<DirentVisitor>,
+    ) -> Status;
+    pub fn siphon_namespace_read(
+        namespace: *const Namespace,
+        path: Slice,
+        offset: u64,
+        length: u64,
+        out: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_namespace_write(namespace: *const Namespace, path: Slice, data: Slice) -> Status;
+    pub fn siphon_namespace_mkdir(namespace: *const Namespace, path: Slice) -> Status;
+    pub fn siphon_machine_confines() -> u8;
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;

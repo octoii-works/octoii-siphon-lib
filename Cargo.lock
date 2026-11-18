@@ -158,6 +158,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "octoii-siphon-lib"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "futures-util",
  "serde",
  "serde_json",

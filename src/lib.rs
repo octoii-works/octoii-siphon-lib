@@ -3,6 +3,7 @@
 //! Register handlers on a host executor to answer typed [`Request`]s from fibers.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
 mod fiber;
+mod namespace;
 mod person;
 mod request;
 mod snapshot;
@@ -23,6 +24,7 @@ use std::{
 use tokio::sync::watch;
 
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
+pub use namespace::{Dirent, FileKind, Namespace, Stat, machine_confines};
 pub use person::{AskedOfPerson, PersonRequest};
 pub use request::{Answer, Asked, Request, RequestId, Unanswered};
 use snapshot::SnapshotHandle;
@@ -37,6 +39,56 @@ pub struct Error {
     pub code: u32,
     pub message: String,
 }
+/// The status returned by the native operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Status {
+    NotFound = 1,
+    Invalid = 2,
+    Closed = 3,
+    Failed = 4,
+    Panicked = 5,
+    CallbackReentry = 6,
+    Denied = 7,
+    ReadOnly = 8,
+    Exists = 9,
+    Unsupported = 10,
+    MissingProgram = 11,
+    Refused = 12,
+    WriteAborted = 13,
+    ReopenRequired = 14,
+    Unknown = u32::MAX,
+}
+
+impl Error {
+    pub fn new(status: Status, message: impl Into<String>) -> Self {
+        Self {
+            code: status as u32,
+            message: message.into(),
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        match self.code {
+            1 => Status::NotFound,
+            2 => Status::Invalid,
+            3 => Status::Closed,
+            4 => Status::Failed,
+            5 => Status::Panicked,
+            6 => Status::CallbackReentry,
+            7 => Status::Denied,
+            8 => Status::ReadOnly,
+            9 => Status::Exists,
+            10 => Status::Unsupported,
+            11 => Status::MissingProgram,
+            12 => Status::Refused,
+            13 => Status::WriteAborted,
+            14 => Status::ReopenRequired,
+            _ => Status::Unknown,
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)

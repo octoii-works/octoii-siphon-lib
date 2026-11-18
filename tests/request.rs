@@ -12,7 +12,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Following, Mail, Options,
-    Outcome, PersonRequest, Published, Request, Result, Run, Runtime, Signal, StreamEvent,
+    Outcome, PersonRequest, Published, Request, Result, Run, Runtime, Signal, Status, StreamEvent,
     Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
@@ -288,7 +288,7 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         )
         .unwrap();
     let error = runtime.commit(&conflicting).unwrap_err();
-    assert_eq!(error.code, 4);
+    assert_eq!(error.status(), Status::Refused);
     assert!(error.message.contains("request-pending"), "{error}");
 
     let mut changes = Changes::new().unwrap();

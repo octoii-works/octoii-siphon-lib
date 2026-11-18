@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use octoii_siphon_lib::{Changes, NameChange, Query, Range, Runtime};
+use octoii_siphon_lib::{Changes, FileKind, NameChange, Namespace, Query, Range, Runtime, Status};
 
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
@@ -326,7 +326,10 @@ fn volume_ids_and_file_retention_survive_reopening() {
 
     let mut blocked = Changes::new().unwrap();
     blocked.append(b"log", b"later").unwrap();
-    assert_eq!(runtime.commit(&blocked).unwrap_err().code, 4);
+    assert_eq!(
+        runtime.commit(&blocked).unwrap_err().status(),
+        Status::ReadOnly
+    );
     let mut clear = Changes::new().unwrap();
     clear.expire(b"log", None).unwrap();
     runtime.commit(&clear).unwrap();
@@ -358,7 +361,10 @@ fn volume_ids_and_file_retention_survive_reopening() {
             .expires_at,
         None
     );
-    assert_eq!(reopened.commit(&blocked).unwrap_err().code, 4);
+    assert_eq!(
+        reopened.commit(&blocked).unwrap_err().status(),
+        Status::ReadOnly
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -464,4 +470,68 @@ async fn failure_cleanup_and_drop_work_inside_an_async_host() {
         assert_ne!(error.code, 5, "locked directory must not panic");
         drop(runtime);
     }
+}
+
+#[test]
+fn a_namespace_mounts_host_and_read_only_volume_views() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_str().unwrap();
+    let namespace = Namespace::new().unwrap();
+    namespace.mount_host("", root, true).unwrap();
+    namespace.mkdir("hidden").unwrap();
+    namespace.write("hidden/notes", b"secret").unwrap();
+    namespace.write("one", b"12345").unwrap();
+    namespace.write("two", b"other").unwrap();
+    assert_eq!(namespace.read("one", 2, 2).unwrap().as_ref(), b"34");
+    namespace.hide("hidden").unwrap();
+    assert_eq!(
+        namespace.read("hidden/notes", 0, 64).unwrap_err().status(),
+        Status::Denied
+    );
+
+    let stat = namespace.stat("one").unwrap().unwrap();
+    assert_eq!((stat.kind, stat.size), (FileKind::File, 5));
+    let range = Range {
+        prefix: b"o",
+        limit: 10,
+        ..Range::default()
+    };
+    let names = namespace.list("", &range).unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].name.as_ref(), b"one");
+
+    let runtime = Runtime::memory().unwrap();
+    let mut changes = Changes::new().unwrap();
+    changes
+        .mkdir(b"document:first")
+        .unwrap()
+        .meta(
+            b"document:first",
+            &[NameChange {
+                name: b"visible",
+                value: Some(b"yes"),
+            }],
+            &[],
+        )
+        .unwrap()
+        .write(b"document:first/note", b"from the volume")
+        .unwrap();
+    runtime.commit(&changes).unwrap();
+    namespace
+        .mount_labels(&runtime, "documents", "document", "visible", b"")
+        .unwrap();
+    assert_eq!(
+        namespace
+            .read("documents/first/note", 0, 128)
+            .unwrap()
+            .as_ref(),
+        b"from the volume"
+    );
+    assert_eq!(
+        namespace
+            .write("documents/first/note", b"new")
+            .unwrap_err()
+            .status(),
+        Status::ReadOnly
+    );
 }

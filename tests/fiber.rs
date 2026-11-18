@@ -331,7 +331,10 @@ fn byte_keyed_mail_wakes_the_right_fiber_and_is_consumed_on_commit() {
         .unwrap()
         .send(&process, &mail, Some(started + 1))
         .unwrap();
-    assert_eq!(runtime.commit(&stale).unwrap_err().code, 4);
+    assert_eq!(
+        runtime.commit(&stale).unwrap_err().status(),
+        octoii_siphon_lib::Status::Refused
+    );
     assert_eq!(
         runtime.snapshot().unwrap().read(b"rolled-back").unwrap(),
         None
@@ -456,7 +459,10 @@ fn a_waiting_process_preserves_its_stop_handler_result() {
     });
     let mut premature = Changes::new().unwrap();
     premature.reap(&path).unwrap();
-    assert_eq!(runtime.commit(&premature).unwrap_err().code, 4);
+    assert_eq!(
+        runtime.commit(&premature).unwrap_err().status(),
+        octoii_siphon_lib::Status::Refused
+    );
 
     let mut changes = Changes::new().unwrap();
     changes

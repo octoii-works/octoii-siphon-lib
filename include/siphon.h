@@ -10,7 +10,7 @@ extern "C" {
  * Never free or mutate handles concurrently with their use.
  * Runtime calls serialize internally. Snapshot reads are thread-safe.
  * Close stops execution; retained snapshots may keep the storage directory locked.
- * Status: 0 success, 1 missing, 2 invalid, 3 closed, 4 failed, 5 panic, 6 callback reentry.
+ * Status codes are listed below.
  * Always free status.error, including on success (a null buffer is accepted).
  */
 typedef struct siphon_runtime siphon_runtime;
@@ -21,9 +21,15 @@ typedef struct siphon_run siphon_run;
 typedef struct siphon_reply siphon_reply;
 typedef struct siphon_commit_watch siphon_commit_watch;
 typedef struct siphon_following siphon_following;
+typedef struct siphon_namespace siphon_namespace;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
+enum {
+    SIPHON_OK = 0, SIPHON_NOT_FOUND, SIPHON_INVALID, SIPHON_CLOSED, SIPHON_FAILED, SIPHON_PANICKED,
+    SIPHON_CALLBACK_REENTRY, SIPHON_DENIED, SIPHON_READ_ONLY, SIPHON_EXISTS, SIPHON_UNSUPPORTED,
+    SIPHON_MISSING_PROGRAM, SIPHON_REFUSED, SIPHON_WRITE_ABORTED, SIPHON_REOPEN_REQUIRED
+};
 typedef struct {
     siphon_slice key;
     siphon_slice name;
@@ -125,6 +131,16 @@ typedef struct {
     siphon_slice data;
 } siphon_stream_view;
 typedef void (*siphon_stream_callback)(void *context, const siphon_stream_view *event);
+enum { SIPHON_FILE_DIRECTORY = 1, SIPHON_FILE_REGULAR, SIPHON_FILE_LINK };
+typedef struct {
+    uint32_t kind;
+    uint8_t executable;
+    uint64_t size;
+    int64_t modified_ms;
+    const uint64_t *file_id;
+} siphon_file_stat;
+typedef void (*siphon_file_visitor)(void *context, const siphon_file_stat *stat);
+typedef void (*siphon_dirent_visitor)(void *context, siphon_slice name, uint32_t kind);
 typedef struct {
     void *context;
     siphon_request_notify notify;
@@ -198,6 +214,23 @@ siphon_status siphon_runtime_follow(const siphon_runtime *runtime, siphon_slice 
 siphon_status siphon_following_read(const siphon_following *following, void *context,
     siphon_stream_callback receive, siphon_release_callback release);
 void siphon_following_free(siphon_following *following);
+/* Namespace paths and host directories are UTF-8. An empty mount point denotes the root. */
+siphon_status siphon_namespace_new(siphon_namespace **out);
+void siphon_namespace_free(siphon_namespace *namespace_);
+siphon_status siphon_namespace_mount_host(const siphon_namespace *namespace_, siphon_slice at,
+    siphon_slice host, uint8_t writable);
+siphon_status siphon_namespace_hide(const siphon_namespace *namespace_, siphon_slice at);
+siphon_status siphon_namespace_mount_labels(const siphon_namespace *namespace_, const siphon_runtime *runtime,
+    siphon_slice at, siphon_slice kind, siphon_slice label, siphon_slice under);
+siphon_status siphon_namespace_stat(const siphon_namespace *namespace_, siphon_slice path, void *context,
+    siphon_file_visitor visit);
+siphon_status siphon_namespace_list(const siphon_namespace *namespace_, siphon_slice path, siphon_snapshot_range range,
+    void *context, siphon_dirent_visitor visit);
+siphon_status siphon_namespace_read(const siphon_namespace *namespace_, siphon_slice path, uint64_t offset,
+    uint64_t length, siphon_buffer *out);
+siphon_status siphon_namespace_write(const siphon_namespace *namespace_, siphon_slice path, siphon_slice data);
+siphon_status siphon_namespace_mkdir(const siphon_namespace *namespace_, siphon_slice path);
+uint8_t siphon_machine_confines(void);
 /* Reads prompts from a snapshot of this volume. Each visitor borrows the view for the call. */
 siphon_status siphon_runtime_person_requests(const siphon_runtime *runtime, const siphon_snapshot *snapshot,
     siphon_slice under, void *context, siphon_person_visitor visit);
