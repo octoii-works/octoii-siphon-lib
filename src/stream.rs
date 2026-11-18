@@ -1,11 +1,7 @@
 use std::{ffi::c_void, ptr::NonNull};
 
-use tokio::sync::oneshot;
-
-use crate::{
-    Error, RequestId, Result, RuntimeHandle, borrow_slice, check, handle, release_context, slice,
-    sys,
-};
+use crate::events::{Events, receive};
+use crate::{Error, RequestId, Result, RuntimeHandle, borrow_slice, check, handle, slice, sys};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Published {
@@ -24,12 +20,10 @@ pub enum StreamEvent {
     Closed(RequestId),
 }
 
-type Event = Result<Option<StreamEvent>>;
-
 #[derive(Debug)]
 pub struct Following {
     handle: NonNull<sys::Following>,
-    pending: Option<oneshot::Receiver<Event>>,
+    events: Events<StreamEvent>,
 }
 
 // SAFETY: native serializes reads and a unique Rust owner cancels the follower.
@@ -45,7 +39,7 @@ impl RuntimeHandle {
         })?;
         Ok(Following {
             handle: handle(out)?,
-            pending: None,
+            events: Events::new(),
         })
     }
 }
@@ -53,31 +47,19 @@ impl RuntimeHandle {
 impl Following {
     /// Reads the next event. A cancelled wait leaves its event for the next call.
     pub async fn next(&mut self) -> Result<Option<StreamEvent>> {
-        if self.pending.is_none() {
-            let (send, receive) = oneshot::channel();
-            let context = Box::into_raw(Box::new(Some(send))).cast();
-            // SAFETY: the follower is live, and native owns the context on every path.
-            let status = unsafe {
-                sys::siphon_following_read(
-                    self.handle.as_ptr(),
-                    context,
-                    Some(received),
-                    Some(release_context::<Option<oneshot::Sender<Event>>>),
-                )
-            };
-            match check(status) {
-                Ok(()) => self.pending = Some(receive),
-                Err(error) if error.code == 3 => return Ok(None),
-                Err(error) => return Err(error),
-            }
-        }
-        let event = self
-            .pending
-            .as_mut()
-            .expect("a stream read is pending")
-            .await;
-        self.pending = None;
-        event.unwrap_or(Ok(None))
+        self.events
+            .next(|context, release| {
+                // SAFETY: the follower is live. Native owns context on every path.
+                unsafe {
+                    sys::siphon_following_read(
+                        self.handle.as_ptr(),
+                        context,
+                        Some(received),
+                        Some(release),
+                    )
+                }
+            })
+            .await
     }
 }
 
@@ -89,13 +71,8 @@ impl Drop for Following {
 }
 
 unsafe extern "C" fn received(context: *mut c_void, view: *const sys::StreamView) {
-    // SAFETY: the callback context is live and only one invocation borrows it.
-    let sender = unsafe { &mut *context.cast::<Option<oneshot::Sender<Event>>>() };
-    if let Some(send) = sender.take() {
-        // SAFETY: the native view is null at end and otherwise readable during the call.
-        let event = unsafe { view.as_ref().map(|view| read_event(view)).transpose() };
-        let _ = send.send(event);
-    }
+    // SAFETY: the event and registered context are live during this callback.
+    unsafe { receive(context, view, read_event) };
 }
 
 /// The view and its non-null fields must remain readable during decoding.

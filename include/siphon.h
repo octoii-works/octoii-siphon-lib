@@ -22,6 +22,8 @@ typedef struct siphon_reply siphon_reply;
 typedef struct siphon_commit_watch siphon_commit_watch;
 typedef struct siphon_following siphon_following;
 typedef struct siphon_namespace siphon_namespace;
+typedef struct siphon_command siphon_command;
+typedef struct siphon_command_events siphon_command_events;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
@@ -141,6 +143,13 @@ typedef struct {
 } siphon_file_stat;
 typedef void (*siphon_file_visitor)(void *context, const siphon_file_stat *stat);
 typedef void (*siphon_dirent_visitor)(void *context, siphon_slice name, uint32_t kind);
+enum { SIPHON_COMMAND_OUTPUT = 1, SIPHON_COMMAND_TITLE, SIPHON_COMMAND_EXIT_CODE, SIPHON_COMMAND_EXIT_SIGNAL };
+typedef struct {
+    uint32_t kind;
+    int32_t value;
+    siphon_slice data;
+} siphon_command_view;
+typedef void (*siphon_command_callback)(void *context, const siphon_command_view *event);
 typedef struct {
     void *context;
     siphon_request_notify notify;
@@ -231,6 +240,24 @@ siphon_status siphon_namespace_read(const siphon_namespace *namespace_, siphon_s
 siphon_status siphon_namespace_write(const siphon_namespace *namespace_, siphon_slice path, siphon_slice data);
 siphon_status siphon_namespace_mkdir(const siphon_namespace *namespace_, siphon_slice path);
 uint8_t siphon_machine_confines(void);
+/* The JSON spec carries exec, cwd, set, clear, stdio, head_bytes, tail_bytes and log.
+ * A command starts within the mounts already configured on namespace_.
+ */
+siphon_status siphon_runtime_spawn(const siphon_runtime *runtime, const siphon_namespace *namespace_,
+    int64_t time, siphon_slice under, siphon_slice spec, siphon_command **command, siphon_command_events **events);
+/* A read transfers context with release on every call. A null event indicates the end. */
+siphon_status siphon_command_events_read(const siphon_command_events *events, void *context,
+    siphon_command_callback receive, siphon_release_callback release);
+void siphon_command_events_free(siphon_command_events *events);
+void siphon_command_free(siphon_command *command);
+siphon_status siphon_command_write(const siphon_command *command, siphon_slice data);
+siphon_status siphon_command_close_input(const siphon_command *command);
+siphon_status siphon_command_signal(const siphon_command *command, uint32_t signal);
+siphon_status siphon_command_resize(const siphon_command *command, uint16_t rows, uint16_t cols);
+siphon_status siphon_command_output(const siphon_command *command, siphon_buffer *out);
+siphon_status siphon_command_read_output(const siphon_command *command, uint64_t from, uint64_t *offset, siphon_buffer *out);
+siphon_status siphon_command_screen(const siphon_command *command, uint64_t *through, siphon_buffer *out);
+siphon_status siphon_command_screen_text(const siphon_command *command, siphon_buffer *out);
 /* Reads prompts from a snapshot of this volume. Each visitor borrows the view for the call. */
 siphon_status siphon_runtime_person_requests(const siphon_runtime *runtime, const siphon_snapshot *snapshot,
     siphon_slice under, void *context, siphon_person_visitor visit);

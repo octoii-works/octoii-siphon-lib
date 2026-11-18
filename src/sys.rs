@@ -18,6 +18,14 @@ pub struct Namespace {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct Command {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct CommandEvents {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Following {
     _private: [u8; 0],
 }
@@ -209,6 +217,14 @@ pub struct StreamView {
     pub offset: u64,
     pub data: Slice,
 }
+#[repr(C)]
+pub struct CommandView {
+    pub kind: u32,
+    pub value: i32,
+    pub data: Slice,
+}
+type CommandCallback = unsafe extern "C" fn(*mut c_void, *const CommandView);
+
 type StreamCallback = unsafe extern "C" fn(*mut c_void, *const StreamView);
 pub const STREAM_RESET: u32 = 1;
 pub const STREAM_DATA: u32 = 2;
@@ -378,6 +394,40 @@ unsafe extern "C" {
     pub fn siphon_namespace_write(namespace: *const Namespace, path: Slice, data: Slice) -> Status;
     pub fn siphon_namespace_mkdir(namespace: *const Namespace, path: Slice) -> Status;
     pub fn siphon_machine_confines() -> u8;
+    pub fn siphon_runtime_spawn(
+        runtime: *const Runtime,
+        namespace: *const Namespace,
+        time: i64,
+        under: Slice,
+        spec: Slice,
+        command: *mut *mut Command,
+        events: *mut *mut CommandEvents,
+    ) -> Status;
+    pub fn siphon_command_events_read(
+        events: *const CommandEvents,
+        context: *mut c_void,
+        receive: Option<CommandCallback>,
+        release: Option<ReleaseCallback>,
+    ) -> Status;
+    pub fn siphon_command_events_free(events: *mut CommandEvents);
+    pub fn siphon_command_free(command: *mut Command);
+    pub fn siphon_command_write(command: *const Command, data: Slice) -> Status;
+    pub fn siphon_command_close_input(command: *const Command) -> Status;
+    pub fn siphon_command_signal(command: *const Command, signal: u32) -> Status;
+    pub fn siphon_command_resize(command: *const Command, rows: u16, cols: u16) -> Status;
+    pub fn siphon_command_output(command: *const Command, out: *mut Buffer) -> Status;
+    pub fn siphon_command_read_output(
+        command: *const Command,
+        from: u64,
+        offset: *mut u64,
+        out: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_command_screen(
+        command: *const Command,
+        through: *mut u64,
+        out: *mut Buffer,
+    ) -> Status;
+    pub fn siphon_command_screen_text(command: *const Command, out: *mut Buffer) -> Status;
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_free(changes: *mut Changes);
     pub fn siphon_changes_mkdir(changes: *mut Changes, path: Slice) -> Status;

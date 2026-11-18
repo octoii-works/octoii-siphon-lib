@@ -2,6 +2,8 @@
 //! Register fibers on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
 //! Register handlers on a host executor to answer typed [`Request`]s from fibers.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
+mod command;
+mod events;
 mod fiber;
 mod namespace;
 mod person;
@@ -23,6 +25,7 @@ use std::{
 
 use tokio::sync::watch;
 
+pub use command::{Chunk, Command, CommandEvent, CommandEvents, Exec, Exit, Screen, Spec, Stdio};
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use namespace::{Dirent, FileKind, Namespace, Stat, machine_confines};
 pub use person::{AskedOfPerson, PersonRequest};
@@ -229,6 +232,11 @@ impl Runtime {
         Ok(Self(Arc::new(Owner {
             handle: ManuallyDrop::new(RuntimeHandle(handle(ptr)?)),
         })))
+    }
+
+    /// Retains access without taking ownership of runtime shutdown.
+    pub fn runtime_handle(&self) -> RuntimeHandle {
+        (**self).clone()
     }
 
     /// Stops execution and waits for the worker. Retained snapshots can still hold the volume lock.
