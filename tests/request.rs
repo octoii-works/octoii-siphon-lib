@@ -11,8 +11,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Answer, Asked, Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome, Request, Result,
-    Run, Runtime, Signal, Unanswered, Wait, process_path,
+    Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome,
+    PersonRequest, Request, Result, Run, Runtime, Signal, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,12 @@ struct Lookup(u32);
 impl Request for Lookup {
     const NAME: &'static str = "contract.lookup";
     type Answer = u32;
+}
+
+impl AskedOfPerson for Lookup {
+    fn answer_schema(&self) -> serde_json::Value {
+        serde_json::json!({"const": self.0})
+    }
 }
 
 struct Twice;
@@ -293,6 +299,95 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
             result: Some(Response::Given(42)),
             reason: None
         },
+    );
+}
+
+fn person_builder() -> Builder {
+    let mut builder = Builder::new().unwrap();
+    builder.fiber(Once).unwrap().ask_person::<Lookup>().unwrap();
+    builder
+}
+
+fn wait_for_prompt(runtime: &Runtime, process: &[u8]) -> PersonRequest {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let snapshot = runtime.snapshot().unwrap();
+        let mut prompts = runtime.person_requests(&snapshot, process).unwrap();
+        if let Some(prompt) = prompts.pop() {
+            assert!(prompts.is_empty());
+            return prompt;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a person request"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut runtime = person_builder().open(directory.path()).unwrap();
+    let process = start::<Once>(&runtime, b"person", &42);
+    let original = wait_for_prompt(&runtime, &process);
+    assert_eq!(original.id.process, process);
+    assert_eq!(original.name, Lookup::NAME.as_bytes());
+    assert_eq!(original.payload, b"42");
+    assert_eq!(original.answer_schema, serde_json::json!({"const": 42}));
+    runtime.close().unwrap();
+
+    let runtime = person_builder().open(directory.path()).unwrap();
+    let standing = runtime.snapshot().unwrap();
+    assert_eq!(
+        runtime
+            .person_requests(&standing, &process)
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&original),
+    );
+    assert!(
+        runtime
+            .person_requests(&standing, b"unrelated")
+            .unwrap()
+            .is_empty()
+    );
+
+    let valid = serde_json::json!(42);
+    let mut other = original.id.clone();
+    other.created_seq += 1;
+    assert_eq!(runtime.answer(&other, &valid).unwrap_err().code, 1);
+    other = original.id.clone();
+    other.started += 1;
+    assert_eq!(runtime.answer(&other, &valid).unwrap_err().code, 1);
+    let error = runtime
+        .answer(&original.id, &serde_json::json!(43))
+        .unwrap_err();
+    assert_eq!(error.code, 2);
+    let still_waiting = runtime.snapshot().unwrap();
+    assert_eq!(
+        runtime
+            .person_requests(&still_waiting, &process)
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&original),
+    );
+
+    assert!(runtime.answer(&original.id, &valid).unwrap() > original.id.created_seq);
+    assert_eq!(runtime.answer(&original.id, &valid).unwrap_err().code, 1);
+    assert_eq!(
+        finish::<Once>(&runtime, &process),
+        Outcome::Completed(Some(Response::Given(42)))
+    );
+    assert!(
+        runtime
+            .person_requests(&runtime.snapshot().unwrap(), &process)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        runtime.person_requests(&standing, &process).unwrap(),
+        vec![original]
     );
 }
 

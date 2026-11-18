@@ -165,6 +165,24 @@ pub struct RequestId {
 }
 
 #[repr(C)]
+pub struct SchemaResult {
+    pub kind: u32,
+    pub payload: Slice,
+    pub context: *mut c_void,
+    pub release: Option<ReleaseCallback>,
+}
+type SchemaCallback = unsafe extern "C" fn(*mut c_void, Slice) -> SchemaResult;
+
+#[repr(C)]
+pub struct PersonRequestView {
+    pub id: RequestId,
+    pub name: Slice,
+    pub payload: Slice,
+    pub answer_schema: Slice,
+}
+type PersonVisitor = unsafe extern "C" fn(*mut c_void, *const PersonRequestView);
+
+#[repr(C)]
 pub struct Watch {
     pub context: *mut c_void,
     pub notify: Option<NotifyCallback>,
@@ -230,6 +248,13 @@ unsafe extern "C" {
         deliver: Option<DeliverCallback>,
         release: Option<ReleaseCallback>,
     ) -> Status;
+    pub fn siphon_builder_ask_person(
+        builder: *mut Builder,
+        name: Slice,
+        context: *mut c_void,
+        schema: Option<SchemaCallback>,
+        release: Option<ReleaseCallback>,
+    ) -> Status;
     pub fn siphon_builder_open(
         builder: *mut Builder,
         directory: Slice,
@@ -243,6 +268,19 @@ unsafe extern "C" {
         seq: *mut u64,
     ) -> Status;
     pub fn siphon_runtime_snapshot(runtime: *const Runtime, out: *mut *mut Snapshot) -> Status;
+    pub fn siphon_runtime_person_requests(
+        runtime: *const Runtime,
+        snapshot: *const Snapshot,
+        under: Slice,
+        context: *mut c_void,
+        visit: Option<PersonVisitor>,
+    ) -> Status;
+    pub fn siphon_runtime_answer(
+        runtime: *const Runtime,
+        id: *const RequestId,
+        answer: Slice,
+        seq: *mut u64,
+    ) -> Status;
     pub fn siphon_runtime_new_id(runtime: *const Runtime, out: *mut Buffer) -> Status;
     pub fn siphon_runtime_now_ms(runtime: *const Runtime, out: *mut i64) -> Status;
     pub fn siphon_runtime_watch_commits(

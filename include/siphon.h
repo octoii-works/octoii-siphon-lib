@@ -102,6 +102,20 @@ typedef struct {
 } siphon_request_id;
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
 typedef struct {
+    uint32_t kind; /* SIPHON_ANSWER_GIVEN for JSON Schema, SIPHON_ANSWER_FAILED for UTF-8 error text. */
+    siphon_slice payload;
+    void *context;
+    siphon_release_callback release;
+} siphon_schema_result;
+typedef siphon_schema_result (*siphon_schema_callback)(void *context, siphon_slice payload);
+typedef struct {
+    siphon_request_id id;
+    siphon_slice name;
+    siphon_slice payload;
+    siphon_slice answer_schema;
+} siphon_person_request_view;
+typedef void (*siphon_person_visitor)(void *context, const siphon_person_request_view *request);
+typedef struct {
     void *context;
     siphon_request_notify notify;
     siphon_release_callback release;
@@ -141,17 +155,29 @@ siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, u
  */
 siphon_status siphon_builder_handle_request(siphon_builder *builder, siphon_slice name, void *context,
     siphon_request_deliver deliver, siphon_release_callback release);
+/* Registration transfers context with release even on error. The schema callback borrows the
+ * request payload. Returned bytes remain readable until Siphon calls the result's release, or
+ * have static lifetime if release is null. Callbacks return promptly and do not unwind.
+ */
+siphon_status siphon_builder_ask_person(siphon_builder *builder, siphon_slice name, void *context,
+    siphon_schema_callback schema, siphon_release_callback release);
 /* Consumes builder on every call; directory is UTF-8, empty for memory storage.
  * Restored phases may invoke their callbacks before this call returns the runtime handle.
  */
 siphon_status siphon_builder_open(siphon_builder *builder, siphon_slice directory, siphon_runtime **out);
-/* Runtime open, explicit close, commit, snapshot, ID and clock calls return status 6 from a callback.
+/* Blocking runtime calls return status 6 from a callback.
  * Free in that context releases the handle immediately and the runtime shuts down asynchronously.
  */
 siphon_status siphon_runtime_close(const siphon_runtime *runtime);
 siphon_status siphon_runtime_free(siphon_runtime *runtime);
 siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, uint64_t *seq);
 siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snapshot **out);
+/* Reads prompts from a snapshot of this volume. Each visitor borrows the view for the call. */
+siphon_status siphon_runtime_person_requests(const siphon_runtime *runtime, const siphon_snapshot *snapshot,
+    siphon_slice under, void *context, siphon_person_visitor visit);
+/* Returns status 1 for a missing or replaced request and status 2 for invalid JSON or an unfit answer. */
+siphon_status siphon_runtime_answer(const siphon_runtime *runtime, const siphon_request_id *id,
+    siphon_slice answer, uint64_t *seq);
 /* IDs are UTF-8 UUIDv7 values from the volume. Free the buffer with siphon_buffer_free. */
 siphon_status siphon_runtime_new_id(const siphon_runtime *runtime, siphon_buffer *out);
 siphon_status siphon_runtime_now_ms(const siphon_runtime *runtime, int64_t *out);

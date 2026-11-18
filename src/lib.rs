@@ -3,6 +3,7 @@
 //! Register handlers on a host executor to answer typed [`Request`]s from fibers.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
 mod fiber;
+mod person;
 mod request;
 mod snapshot;
 mod sys;
@@ -19,6 +20,7 @@ use std::{
 use tokio::sync::watch;
 
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
+pub use person::{AskedOfPerson, PersonRequest};
 pub use request::{Answer, Asked, Request, RequestId, Unanswered};
 use snapshot::SnapshotHandle;
 pub use snapshot::{

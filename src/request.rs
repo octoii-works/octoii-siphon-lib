@@ -34,6 +34,27 @@ pub struct RequestId {
     pub created_seq: u64,
 }
 
+impl RequestId {
+    /// The native view and both slices must be readable.
+    pub(crate) unsafe fn from_view(id: &sys::RequestId) -> Self {
+        Self {
+            process: unsafe { borrow_slice(id.process) }.to_vec(),
+            started: id.started,
+            key: unsafe { borrow_slice(id.key) }.to_vec(),
+            created_seq: id.created_seq,
+        }
+    }
+
+    pub(crate) fn view(&self) -> sys::RequestId {
+        sys::RequestId {
+            process: slice(&self.process),
+            started: self.started,
+            key: slice(&self.key),
+            created_seq: self.created_seq,
+        }
+    }
+}
+
 /// A delivered request passed to its host handler.
 #[derive(Debug)]
 pub struct Asked<R> {
@@ -152,16 +173,7 @@ where
     let started = catch_unwind(AssertUnwindSafe(move || {
         // SAFETY: native keeps its registration and slices live throughout the callback.
         let registration = unsafe { &*context.cast::<Registration<F>>() };
-        let (id, payload) = unsafe {
-            let id = &*id;
-            let owned = RequestId {
-                process: borrow_slice(id.process).to_vec(),
-                started: id.started,
-                key: borrow_slice(id.key).to_vec(),
-                created_seq: id.created_seq,
-            };
-            (owned, borrow_slice(payload).to_vec())
-        };
+        let (id, payload) = unsafe { (RequestId::from_view(&*id), borrow_slice(payload).to_vec()) };
         let cancelled = CancellationToken::new();
         let signal = cancelled.clone();
         let handler = Arc::clone(&registration.handler);
