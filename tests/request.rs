@@ -14,8 +14,8 @@ use std::{
 
 use octoii_siphon_lib::{
     Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Following, Mail, Options,
-    Outcome, PersonRequest, Published, Request, Run, Runtime, Signal, Status, StreamEvent,
-    Unanswered, Wait, process_path,
+    Outcome, PersonRequest, Published, Request, RequestId, Run, Runtime, Signal, Status,
+    StreamEvent, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,7 +103,7 @@ impl Fiber for Twice {
                 let Some(Answer::Given(first)) = run.answer::<Lookup>(&first_key)? else {
                     panic!("first answer missing");
                 };
-                run.take_mail(&first_key)?;
+                run.discard_mail(&first_key)?;
                 assert_eq!(
                     run.answer::<Lookup>(&first_key)?,
                     Some(Answer::Given(first))
@@ -129,7 +129,7 @@ impl Fiber for Twice {
                 let Some(Answer::Given(second)) = run.answer::<Lookup>(&second_key)? else {
                     panic!("second answer missing");
                 };
-                run.take_mail(&second_key)?;
+                run.discard_mail(&second_key)?;
                 run.changes
                     .write(b"answers", format!("{first}, {second}").as_bytes());
                 Ok(Ending::Done((first, second)))
@@ -183,19 +183,15 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
     let process = start::<Twice>(&runtime, b"twice", &21);
     let (first, first_input) = received.recv_timeout(TIMEOUT).unwrap();
     let (second, second_input) = received.recv_timeout(TIMEOUT).unwrap();
-    assert_ne!(first.key, second.key);
-    assert_eq!(first.process, process);
-    assert_eq!(second.process, process);
+    assert_ne!(first.key(), second.key());
+    assert_eq!(first.path(), process);
+    assert_eq!(second.path(), process);
     assert_eq!((first_input, second_input), (21, 42));
     assert_eq!(
         finish::<Twice>(&runtime, &process),
         Outcome::Completed(Some((42, 84)))
     );
     let snapshot = runtime.snapshot().unwrap();
-    let created = snapshot.fiber(&process).unwrap().unwrap().created_seq;
-    assert_eq!((first.started, second.started), (created, created));
-    assert!(created < first.created_seq && first.created_seq < second.created_seq);
-    assert!(second.created_seq <= snapshot.sequence().unwrap());
     assert_eq!(
         snapshot.read(b"answers").unwrap().as_deref(),
         Some(b"42, 84".as_slice())
@@ -243,7 +239,7 @@ impl Fiber for Once {
         checkpoint: Option<String>,
     ) -> anyhow::Result<Ending<String, Response>> {
         let Some(key) = checkpoint else {
-            let key = run.new_id()?;
+            let key = "lookup".to_owned();
             run.request(&key, &Lookup(input))?;
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
@@ -251,7 +247,7 @@ impl Fiber for Once {
             // A stop handler can run before the async host has given its partial result.
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
-        run.take_mail(&key)?;
+        run.discard_mail(&key)?;
         if run.is_stop_handler() {
             Ok(Ending::Stopped(Some(answer)))
         } else {
@@ -280,12 +276,12 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     let runtime = builder.memory().unwrap();
     let process = start::<Once>(&runtime, b"stop", &42);
     let request = running.recv_timeout(TIMEOUT).unwrap();
-    assert_eq!(request.process, process);
+    assert_eq!(request.path(), process);
     let mut conflicting = Changes::new();
     conflicting.send(
         &process,
         Mail {
-            key: request.key.into(),
+            key: Bytes::copy_from_slice(request.key()),
             name: Bytes::from_static(b"ordinary"),
             payload: Bytes::from_static(b"reserved"),
         },
@@ -336,7 +332,8 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     let runtime = person_builder().open(directory.path()).unwrap();
     let process = start::<Once>(&runtime, b"person", &42);
     let original = wait_for_prompt(&runtime, &process);
-    assert_eq!(original.id.process, process);
+    assert_eq!(original.id.path(), process);
+    let token = original.id.to_token();
     assert_eq!(original.name, Lookup::NAME.as_bytes());
     assert_eq!(original.payload, b"42");
     assert_eq!(original.answer_schema, serde_json::json!({"const": 42}));
@@ -359,14 +356,10 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     );
 
     let valid = serde_json::json!(42);
-    let mut other = original.id.clone();
-    other.created_seq += 1;
-    assert_eq!(runtime.answer_blocking(&other, &valid).unwrap_err().code, 1);
-    other = original.id.clone();
-    other.started += 1;
-    assert_eq!(runtime.answer_blocking(&other, &valid).unwrap_err().code, 1);
+    let id = RequestId::from_token(&token).unwrap();
+    assert_eq!(id, original.id);
     let error = runtime
-        .answer_blocking(&original.id, &serde_json::json!(43))
+        .answer_blocking(&id, &serde_json::json!(43))
         .unwrap_err();
     assert_eq!(error.code, 2);
     let still_waiting = runtime.snapshot().unwrap();
@@ -378,7 +371,7 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
         std::slice::from_ref(&original),
     );
 
-    assert!(runtime.answer_blocking(&original.id, &valid).unwrap() > original.id.created_seq);
+    assert!(runtime.answer_blocking(&id, &valid).unwrap() > standing.sequence().unwrap());
     assert_eq!(
         runtime
             .answer_blocking(&original.id, &valid)
@@ -399,6 +392,22 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     assert_eq!(
         runtime.person_requests(&standing, &process).unwrap(),
         vec![original]
+    );
+
+    let mut reap = Changes::new();
+    reap.reap(&process);
+    runtime.commit_blocking(&reap).unwrap();
+    assert_eq!(start::<Once>(&runtime, b"person", &42), process);
+    let current = wait_for_prompt(&runtime, &process);
+    assert_eq!(current.id.path(), id.path());
+    assert_eq!(current.id.key(), id.key());
+    assert_ne!(current.id, id);
+    let stale = runtime.answer_blocking(&id, &valid).unwrap_err();
+    assert_eq!(stale.status(), Status::NotFound);
+    runtime.answer_blocking(&current.id, &valid).unwrap();
+    assert_eq!(
+        finish::<Once>(&runtime, &process),
+        Outcome::Completed(Some(Response::Given(42)))
     );
 }
 
@@ -440,7 +449,7 @@ async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(id.process, process);
+    assert_eq!(id.path(), process);
     let part = |offset, data: &[u8]| {
         Some(StreamEvent::Data(Published {
             topic: "thread".into(),
@@ -506,14 +515,15 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
             let started = started.clone();
             async move {
                 let _dropped = dropped;
-                let record = asked
-                    .runtime
-                    .snapshot()
-                    .unwrap()
-                    .fiber(&asked.id.process)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(record.created_seq, asked.id.started);
+                assert!(
+                    asked
+                        .runtime
+                        .snapshot()
+                        .unwrap()
+                        .fiber(asked.id.path())
+                        .unwrap()
+                        .is_some()
+                );
                 started.send(asked.runtime.clone()).unwrap();
                 // A poll already on the host executor can outlive native shutdown.
                 blocked.recv().unwrap();

@@ -25,17 +25,40 @@ pub trait Request: Serialize + DeserializeOwned + Send + 'static {
 /// The durable identity of one request in a volume.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestId {
-    /// The requesting Fiber's path.
-    pub process: Vec<u8>,
-    /// The Fiber's creation sequence.
-    pub started: u64,
-    /// The request's mailbox key.
-    pub key: Vec<u8>,
-    /// The request's creation sequence.
-    pub created_seq: u64,
+    process: Vec<u8>,
+    started: u64,
+    key: Vec<u8>,
+    created_seq: u64,
 }
 
 impl RequestId {
+    /// The path of the Fiber that posted the request.
+    pub fn path(&self) -> &[u8] {
+        &self.process
+    }
+
+    /// The request's mailbox key.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Encodes the identity for transport as an opaque string.
+    pub fn to_token(&self) -> String {
+        serde_json::to_string(&(&self.process, self.started, &self.key, self.created_seq))
+            .expect("a request identity is serializable")
+    }
+
+    /// Decodes a token from `to_token`. The runtime checks the identity when an answer is submitted.
+    pub fn from_token(token: &str) -> Option<Self> {
+        let (process, started, key, created_seq) = serde_json::from_str(token).ok()?;
+        Some(Self {
+            process,
+            started,
+            key,
+            created_seq,
+        })
+    }
+
     /// The native view and both slices must be readable.
     pub(crate) unsafe fn from_view(id: &sys::RequestId) -> Self {
         Self {
@@ -251,5 +274,24 @@ unsafe extern "C" fn notify(context: *mut c_void, event: u32) {
         _ => {}
     })) {
         discard_panic(panic);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_tokens_preserve_bytes_and_full_sequence_numbers() {
+        let id = RequestId {
+            process: b"/threads/a/\xff".to_vec(),
+            started: u64::MAX - 2,
+            key: b"\xfe\0".to_vec(),
+            created_seq: u64::MAX,
+        };
+        let encoded = serde_json::to_string(&id.to_token()).unwrap();
+        let token: String = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(RequestId::from_token(&token), Some(id));
+        assert_eq!(RequestId::from_token("mailbox-key"), None);
     }
 }

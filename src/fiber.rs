@@ -291,7 +291,7 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Cancels a pending request in this Fiber's mailbox.
+    /// Stages cancellation of a pending request in this Fiber's mailbox.
     pub fn cancel_request(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
         // SAFETY: the phase is live and exclusive and the key is readable.
         check(unsafe { sys::siphon_run_cancel_request(self.phase.as_ptr(), slice(key.as_ref())) })
@@ -331,7 +331,6 @@ impl<'a> Run<'a> {
         Ok(Some(answer))
     }
 
-    /// Stages removal of mail at `key` with the phase's other changes.
     /// Reads a mailbox entry from the immutable phase snapshot.
     pub fn mail(&self, key: &[u8]) -> Result<Option<Mail>> {
         let mut mail: Option<Mail> = None;
@@ -353,11 +352,10 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Stages consumption in the phase's commit.
-    pub fn take_mail(&mut self, key: impl AsRef<[u8]>) -> Result<&mut Self> {
+    /// Stages removal of the mailbox entry at `key` with the phase's other changes.
+    pub fn discard_mail(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
         // SAFETY: the phase is live and exclusive, and key is readable for this call.
-        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_ref())) })?;
-        Ok(self)
+        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_ref())) })
     }
 
     /// Starts a direct child of this Fiber in the same commit.

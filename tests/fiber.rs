@@ -341,7 +341,7 @@ impl Fiber for ReceivesMail {
         assert_eq!(mail.payload, Bytes::from_static(b"\x00\xff"));
         let process = run.path().to_vec();
         let started = run.snapshot().fiber(&process)?.unwrap().created_seq;
-        run.take_mail(MAIL_KEY)?;
+        run.discard_mail(MAIL_KEY)?;
         run.changes.send(
             &process,
             Mail {
