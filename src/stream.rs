@@ -1,7 +1,9 @@
 use std::{ffi::c_void, ptr::NonNull};
 
 use crate::events::{Events, receive};
-use crate::{Error, RequestId, Result, RuntimeHandle, borrow_slice, check, handle, slice, sys};
+use crate::{
+    Error, RequestId, Result, RuntimeHandle, Status, borrow_slice, check, handle, slice, sys,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Published {
@@ -82,10 +84,10 @@ unsafe fn read_event(view: &sys::StreamView) -> Result<StreamEvent> {
         (sys::STREAM_DATA, Some(id)) => {
             let topic =
                 std::str::from_utf8(unsafe { borrow_slice(view.topic) }).map_err(|error| {
-                    Error {
-                        code: 4,
-                        message: format!("Siphon returned an invalid stream topic: {error}"),
-                    }
+                    Error::new(
+                        Status::Failed,
+                        format!("Siphon returned an invalid stream topic: {error}"),
+                    )
                 })?;
             Ok(StreamEvent::Data(Published {
                 topic: topic.to_owned(),
@@ -97,9 +99,9 @@ unsafe fn read_event(view: &sys::StreamView) -> Result<StreamEvent> {
         (sys::STREAM_CLOSED, Some(id)) => {
             Ok(StreamEvent::Closed(unsafe { RequestId::from_view(id) }))
         }
-        _ => Err(Error {
-            code: 4,
-            message: "Siphon returned an invalid stream event".into(),
-        }),
+        _ => Err(Error::new(
+            Status::Failed,
+            "Siphon returned an invalid stream event",
+        )),
     }
 }

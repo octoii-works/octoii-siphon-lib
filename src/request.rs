@@ -3,17 +3,18 @@ use std::{
     fmt,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use futures_util::FutureExt;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{runtime::Handle, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
+use crate::command::spawn_with;
 use crate::{
-    Builder, Error, Result, RuntimeHandle, borrow_slice, check, discard_panic, panic_message,
-    release_context, slice, sys,
+    Builder, Command, CommandEvents, FiberId, Namespace, Result, RuntimeHandle, Spec, borrow_slice,
+    check, discard_panic, panic_message, release_context, slice, sys,
 };
 
 /// A request name, its typed payload, and the value returned by its handler.
@@ -23,18 +24,23 @@ pub trait Request: Serialize + DeserializeOwned + Send + 'static {
 }
 
 /// The durable identity of one request in a volume.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId {
-    process: Vec<u8>,
-    started: u64,
+    fiber: FiberId,
     key: Vec<u8>,
+    generation: [u8; 16],
     created_seq: u64,
 }
 
 impl RequestId {
+    /// The exact Fiber instance that posted the request.
+    pub fn fiber(&self) -> &FiberId {
+        &self.fiber
+    }
+
     /// The path of the Fiber that posted the request.
     pub fn path(&self) -> &[u8] {
-        &self.process
+        self.fiber.path()
     }
 
     /// The request's mailbox key.
@@ -44,36 +50,29 @@ impl RequestId {
 
     /// Encodes the identity for transport as an opaque string.
     pub fn to_token(&self) -> String {
-        serde_json::to_string(&(&self.process, self.started, &self.key, self.created_seq))
-            .expect("a request identity is serializable")
+        serde_json::to_string(self).expect("a request identity is serializable")
     }
 
     /// Decodes a token from `to_token`. The runtime checks the identity when an answer is submitted.
     pub fn from_token(token: &str) -> Option<Self> {
-        let (process, started, key, created_seq) = serde_json::from_str(token).ok()?;
-        Some(Self {
-            process,
-            started,
-            key,
-            created_seq,
-        })
+        serde_json::from_str(token).ok()
     }
 
     /// The native view and both slices must be readable.
     pub(crate) unsafe fn from_view(id: &sys::RequestId) -> Self {
         Self {
-            process: unsafe { borrow_slice(id.process) }.to_vec(),
-            started: id.started,
+            fiber: unsafe { FiberId::from_view(&id.fiber) },
             key: unsafe { borrow_slice(id.key) }.to_vec(),
+            generation: id.generation,
             created_seq: id.created_seq,
         }
     }
 
     pub(crate) fn view(&self) -> sys::RequestId {
         sys::RequestId {
-            process: slice(&self.process),
-            started: self.started,
+            fiber: self.fiber.view(),
             key: slice(&self.key),
+            generation: self.generation,
             created_seq: self.created_seq,
         }
     }
@@ -87,18 +86,42 @@ pub struct Asked<R> {
     pub runtime: RuntimeHandle,
     /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
     pub cancelled: CancellationToken,
-    delivery: Weak<Reply>,
+    delivery: Arc<Reply>,
 }
 
 impl<R> Asked<R> {
     /// Publishes bytes for this request while its delivery is open.
     pub fn publish(&self, topic: &str, data: &[u8]) -> Result<()> {
-        let reply = self.delivery.upgrade().ok_or_else(|| Error {
-            code: 3,
-            message: "request delivery is closed".into(),
-        })?;
-        // SAFETY: reply is owned through this call, and topic and data remain readable.
-        check(unsafe { sys::siphon_reply_publish(reply.0, slice(topic.as_bytes()), slice(data)) })
+        // SAFETY: the reply is live, and topic and data remain readable during the call.
+        check(unsafe {
+            sys::siphon_reply_publish(self.delivery.0, slice(topic.as_bytes()), slice(data))
+        })
+    }
+
+    /// Provides command launches owned by this exact request.
+    #[must_use]
+    pub fn commands(&self) -> RequestCommands {
+        RequestCommands {
+            reply: Arc::clone(&self.delivery),
+        }
+    }
+}
+
+/// Starts commands owned by one request delivery.
+#[derive(Debug, Clone)]
+pub struct RequestCommands {
+    reply: Arc<Reply>,
+}
+
+impl RequestCommands {
+    /// Starts a command while the request accepts new commands. Requires [`Builder::local_machine`].
+    pub fn spawn(&self, namespace: &Namespace, spec: &Spec) -> Result<(Command, CommandEvents)> {
+        spawn_with(spec, |spec, command, events| {
+            // SAFETY: both handles and the spec remain live. Outputs are writable and distinct.
+            unsafe {
+                sys::siphon_reply_spawn(self.reply.0, namespace.0.as_ptr(), spec, command, events)
+            }
+        })
     }
 }
 
@@ -132,9 +155,9 @@ impl Builder {
     /// Registers a request handler on a host Tokio executor.
     ///
     /// The executor must run while requests are handled. Delivery can begin during
-    /// [`Builder::open`], before the caller receives the Siphon runtime. A process stop signals
-    /// [`Asked::cancelled`] so the handler can cooperate. Closing a delivery asks the executor to
-    /// abort its task and lets Siphon shut down without waiting for the host.
+    /// [`Builder::start`]. A process stop signals [`Asked::cancelled`] so the handler can
+    /// cooperate. Closing a delivery asks the executor to abort its task and lets Siphon
+    /// shut down without waiting for the host.
     pub fn handle<R, F, A>(&mut self, executor: &Handle, handler: F) -> Result<&mut Self>
     where
         R: Request,
@@ -171,9 +194,10 @@ struct Delivery {
     task: AbortHandle,
 }
 
+#[derive(Debug)]
 struct Reply(*mut sys::Reply);
 
-// SAFETY: the native reply serializes publication and submission. Arc owns its lifetime.
+// SAFETY: native synchronizes reply operations, and Arc owns the handle's lifetime.
 unsafe impl Send for Reply {}
 // SAFETY: as above, free occurs only once after all references are dropped.
 unsafe impl Sync for Reply {}
@@ -217,7 +241,7 @@ where
         let cancelled = CancellationToken::new();
         let signal = cancelled.clone();
         let handler = Arc::clone(&registration.handler);
-        let delivery = Arc::downgrade(&reply);
+        let delivery = Arc::clone(&reply);
         let mut retained = std::ptr::null();
         // SAFETY: the reply is live and retained is writable.
         let runtime = check(unsafe { sys::siphon_reply_runtime(reply.0, &mut retained) })
@@ -283,15 +307,28 @@ mod tests {
 
     #[test]
     fn request_tokens_preserve_bytes_and_full_sequence_numbers() {
-        let id = RequestId {
-            process: b"/threads/a/\xff".to_vec(),
-            started: u64::MAX - 2,
-            key: b"\xfe\0".to_vec(),
+        let view = sys::RequestId {
+            fiber: sys::FiberId {
+                path: slice(b"/threads/a/\xff"),
+                generation: [1; 16],
+            },
+            key: slice(b"\xfe\0"),
+            generation: [2; 16],
             created_seq: u64::MAX,
         };
+        // SAFETY: both slices refer to static bytes.
+        let id = unsafe { RequestId::from_view(&view) };
         let encoded = serde_json::to_string(&id.to_token()).unwrap();
         let token: String = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(RequestId::from_token(&token), Some(id));
+        let decoded = RequestId::from_token(&token).unwrap();
+        assert_eq!(decoded, id);
+        assert_eq!(decoded.path(), b"/threads/a/\xff");
+        assert_eq!(decoded.key(), b"\xfe\0");
+        let decoded = decoded.view();
+        assert_eq!(decoded.fiber.generation, view.fiber.generation);
+        assert_eq!(decoded.generation, view.generation);
+        assert_eq!(decoded.created_seq, view.created_seq);
         assert_eq!(RequestId::from_token("mailbox-key"), None);
+        assert_eq!(RequestId::from_token("[[1],2,[3],4]"), None);
     }
 }

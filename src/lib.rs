@@ -1,5 +1,5 @@
 //! Safe Rust interface to a separately built Siphon binary.
-//! Register fibers on a [`Builder`] and use a [`Run`] to stage the writes of each phase.
+//! Open a volume for state operations. A [`Builder`] registers callbacks before starting execution.
 //! Register handlers on a host executor to answer typed [`Request`]s from fibers.
 //! Calls are synchronous; async applications should use their blocking-task facility for long operations.
 mod changes;
@@ -30,7 +30,7 @@ pub use command::{Chunk, Command, CommandEvent, CommandEvents, Exec, Exit, Scree
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use namespace::{Dirent, FileKind, Namespace, Stat, machine_confines};
 pub use person::{AskedOfPerson, PersonRequest};
-pub use request::{Answer, Asked, Request, RequestId, Unanswered};
+pub use request::{Answer, Asked, Request, RequestCommands, RequestId, Unanswered};
 pub use snapshot::{
     ChangeSet, Directory, Entry, FiberRecord, Found, Journal, OwnedSnapshot, Query, Range, Snapshot,
 };
@@ -60,6 +60,8 @@ pub enum Status {
     Refused = 12,
     WriteAborted = 13,
     ReopenRequired = 14,
+    Conflict = 15,
+    WouldBlock = 16,
     Unknown = u32::MAX,
 }
 
@@ -87,6 +89,8 @@ impl Error {
             12 => Status::Refused,
             13 => Status::WriteAborted,
             14 => Status::ReopenRequired,
+            15 => Status::Conflict,
+            16 => Status::WouldBlock,
             _ => Status::Unknown,
         }
     }
@@ -184,7 +188,7 @@ fn decode_id(status: sys::Status, buffer: sys::Buffer) -> Result<String> {
 }
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
-    if unsafe { sys::siphon_abi_version() } == 5 {
+    if unsafe { sys::siphon_abi_version() } == 6 {
         Ok(())
     } else {
         Err(Error {
@@ -200,6 +204,36 @@ fn handle<T>(ptr: *mut T) -> Result<NonNull<T>> {
     })
 }
 
+/// The native identity of one Fiber instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FiberId {
+    path: Vec<u8>,
+    generation: [u8; 16],
+}
+
+impl FiberId {
+    /// The execution address at which the instance was created.
+    pub fn path(&self) -> &[u8] {
+        &self.path
+    }
+
+    /// Safety: the native view and its path must be readable.
+    pub(crate) unsafe fn from_view(id: &sys::FiberId) -> Self {
+        Self {
+            // SAFETY: the caller keeps the native path live while copied.
+            path: unsafe { borrow_slice(id.path) }.to_vec(),
+            generation: id.generation,
+        }
+    }
+
+    pub(crate) fn view(&self) -> sys::FiberId {
+        sys::FiberId {
+            path: slice(&self.path),
+            generation: self.generation,
+        }
+    }
+}
+
 /// The address of the process keyed by `key` under `parent`. An empty parent denotes the root.
 pub fn process_path(parent: &[u8], key: &[u8]) -> bytes::Bytes {
     let mut out = sys::Buffer::default();
@@ -210,7 +244,7 @@ pub fn process_path(parent: &[u8], key: &[u8]) -> bytes::Bytes {
     path.into()
 }
 
-/// Owns the running volume and its executor. The last owner starts shutdown.
+/// Owns an open volume and its executor. The last owner starts shutdown.
 #[derive(Debug, Clone)]
 pub struct Runtime(Arc<Owner>);
 
@@ -220,9 +254,24 @@ struct Owner {
 }
 
 impl Runtime {
-    fn from_open(ptr: *mut sys::Runtime) -> Result<Self> {
+    /// Opens the volume for state operations. An absent directory opens a memory volume.
+    /// The optional limit selects how many journal entries this opening retains.
+    pub fn open(directory: Option<&std::path::Path>, journal_entries: Option<u64>) -> Result<Self> {
+        compatible()?;
+        let directory = match directory {
+            Some(path) => path
+                .to_str()
+                .ok_or_else(|| Error::new(Status::Invalid, "volume path must be UTF-8"))?,
+            None => "",
+        };
+        let limit = journal_entries
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the directory and optional limit are readable, and out is writable.
+        check(unsafe { sys::siphon_runtime_open(slice(directory.as_bytes()), limit, &mut out) })?;
         Ok(Self(Arc::new(Owner {
-            handle: ManuallyDrop::new(RuntimeHandle(handle(ptr)?)),
+            handle: ManuallyDrop::new(RuntimeHandle(handle(out)?)),
         })))
     }
 
@@ -283,7 +332,7 @@ impl RuntimeHandle {
     }
 
     /// Commits a batch without blocking the caller's asynchronous executor.
-    pub async fn commit(&self, changes: Changes) -> Result<u64> {
+    pub async fn commit(&self, changes: Changes) -> Result<Revision> {
         let runtime = self.clone();
         tokio::task::spawn_blocking(move || runtime.commit_blocking(&changes))
             .await
@@ -291,12 +340,21 @@ impl RuntimeHandle {
     }
 
     /// Commits a batch on a synchronous caller thread.
-    pub fn commit_blocking(&self, changes: &Changes) -> Result<u64> {
-        changes.ready()?;
-        let mut seq = 0;
+    pub fn commit_blocking(&self, changes: &Changes) -> Result<Revision> {
+        let mut out = std::ptr::null_mut();
         // SAFETY: handles remain live and changes are immutably borrowed during the call.
-        check(unsafe { sys::siphon_runtime_commit(self.0.as_ptr(), changes.as_ptr(), &mut seq) })?;
-        Ok(seq)
+        check(unsafe { sys::siphon_runtime_commit(self.0.as_ptr(), changes.as_ptr(), &mut out) })?;
+        Revision::from_owned(out)
+    }
+
+    /// Confirms this revision on persistent storage and returns its durable sequence.
+    pub fn flush(&self, revision: &Revision) -> Result<u64> {
+        let mut through = 0;
+        // SAFETY: the runtime and receipt remain live, and through is writable.
+        check(unsafe {
+            sys::siphon_runtime_flush(self.0.as_ptr(), revision.0.as_ptr(), &mut through)
+        })?;
+        Ok(through)
     }
     pub fn snapshot(&self) -> Result<OwnedSnapshot> {
         let mut out = std::ptr::null_mut();
@@ -320,9 +378,9 @@ impl RuntimeHandle {
         Ok(now)
     }
 
-    /// Watches the latest committed sequence. Read the snapshot journal for change details.
-    pub fn committed(&self) -> Result<CommitWatch> {
-        let (sender, receiver) = watch::channel(0);
+    /// Follows commit notifications and the runtime's terminal outcome.
+    pub fn commits(&self) -> Result<CommitSubscription> {
+        let (sender, receiver) = watch::channel(None);
         let context = Box::into_raw(Box::new(sender)).cast();
         let mut out = std::ptr::null_mut();
         // SAFETY: the runtime and output are live. The native call takes ownership of context.
@@ -331,45 +389,101 @@ impl RuntimeHandle {
                 self.0.as_ptr(),
                 context,
                 Some(received_commit),
-                Some(release_context::<watch::Sender<u64>>),
+                Some(release_context::<CommitSender>),
                 &mut out,
             )
         })?;
-        let handle = handle(out)?;
-        Ok(CommitWatch { handle, receiver })
+        Ok(CommitSubscription {
+            handle: handle(out)?,
+            receiver,
+        })
     }
 }
 
-/// Observes the latest committed sequence. Notifications can coalesce commits.
+/// A visible commit receipt from one open volume.
 #[derive(Debug)]
-pub struct CommitWatch {
-    handle: NonNull<sys::CommitWatch>,
-    receiver: watch::Receiver<u64>,
-}
+pub struct Revision(NonNull<sys::Revision>);
 
-// SAFETY: the native watch is owned. Its only operation here is cancellation on drop.
-unsafe impl Send for CommitWatch {}
+// SAFETY: a receipt is immutable and owned by this wrapper.
+unsafe impl Send for Revision {}
+// SAFETY: concurrent reads of the receipt do not mutate it.
+unsafe impl Sync for Revision {}
 
-impl CommitWatch {
-    /// Returns the current sequence on the first call, then waits for a later sequence.
-    /// When the runtime closes, returns any unseen sequence before returning `None`.
-    pub async fn next(&mut self) -> Option<u64> {
-        self.receiver.changed().await.ok()?;
-        Some(*self.receiver.borrow_and_update())
+impl Revision {
+    pub(crate) fn from_owned(out: *mut sys::Revision) -> Result<Self> {
+        Ok(Self(handle(out)?))
+    }
+
+    /// The receipt's visible commit sequence.
+    pub fn seq(&self) -> Result<u64> {
+        let mut seq = 0;
+        // SAFETY: this receipt remains live and the output is writable.
+        check(unsafe { sys::siphon_revision_seq(self.0.as_ptr(), &mut seq) })?;
+        Ok(seq)
     }
 }
 
-impl Drop for CommitWatch {
+impl Drop for Revision {
+    fn drop(&mut self) {
+        // SAFETY: this is the sole release of the owned receipt.
+        unsafe { sys::siphon_revision_free(self.0.as_ptr()) };
+    }
+}
+
+/// An observation of the commit head or its terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitEvent {
+    Head(u64),
+    Closed(u64),
+    Fault { head: u64, error: Error },
+}
+
+type CommitSender = watch::Sender<Option<Result<CommitEvent>>>;
+
+/// Observes the volume's head. Notifications can coalesce commits.
+#[derive(Debug)]
+pub struct CommitSubscription {
+    handle: NonNull<sys::CommitWatch>,
+    receiver: watch::Receiver<Option<Result<CommitEvent>>>,
+}
+
+// SAFETY: the native subscription is owned. Its only ABI operation here is cancellation on drop.
+unsafe impl Send for CommitSubscription {}
+
+impl CommitSubscription {
+    /// Delivers a head or terminal event. After a terminal event the subscription ends.
+    pub async fn next(&mut self) -> Result<Option<CommitEvent>> {
+        if self.receiver.changed().await.is_err() {
+            return Ok(None);
+        }
+        self.receiver.borrow_and_update().clone().transpose()
+    }
+}
+
+impl Drop for CommitSubscription {
     fn drop(&mut self) {
         // SAFETY: the handle is uniquely owned and freed once.
         unsafe { sys::siphon_commit_watch_free(self.handle.as_ptr()) };
     }
 }
 
-unsafe extern "C" fn received_commit(context: *mut c_void, seq: u64) {
-    // SAFETY: the native registration keeps the boxed sender alive through its last notification.
-    let sender = unsafe { &*context.cast::<watch::Sender<u64>>() };
-    sender.send_replace(seq);
+unsafe extern "C" fn received_commit(context: *mut c_void, event: *const sys::CommitEvent) {
+    // SAFETY: the native callback borrows a live event and the registration owns the sender.
+    let (sender, event) = unsafe { (&*context.cast::<CommitSender>(), &*event) };
+    let value = match event.kind {
+        sys::COMMIT_HEAD => Ok(CommitEvent::Head(event.seq)),
+        sys::COMMIT_CLOSED => Ok(CommitEvent::Closed(event.seq)),
+        sys::COMMIT_FAULT => Ok(CommitEvent::Fault {
+            head: event.seq,
+            error: Error {
+                code: event.status,
+                // SAFETY: the error slice is borrowed through the end of this callback.
+                message: String::from_utf8_lossy(unsafe { borrow_slice(event.error) }).into_owned(),
+            },
+        }),
+        _ => Err(Error::new(Status::Invalid, "unknown Siphon commit event")),
+    };
+    sender.send_replace(Some(value));
 }
 
 fn present(status: sys::Status) -> Result<bool> {

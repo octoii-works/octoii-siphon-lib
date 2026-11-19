@@ -2,7 +2,6 @@ use std::{
     ffi::c_void,
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::Path,
     ptr::NonNull,
 };
 
@@ -11,30 +10,28 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{from_slice, to_vec};
 
 use crate::{
-    Answer, Batch, Error, Mail, Request, Result, Runtime, RuntimeHandle, Snapshot, borrow_slice,
-    check, compatible, discard_panic, handle, panic_message, present, release_context, slice, sys,
-    take,
+    Answer, Batch, Error, FiberId, Mail, Request, Result, RuntimeHandle, Snapshot, borrow_slice,
+    check, discard_panic, handle, panic_message, present, release_context, slice, sys, take,
 };
 
-/// Fibers and request handlers to register before opening a runtime.
+/// Fibers, request handlers, and adapters to register before starting execution.
 #[derive(Debug)]
 pub struct Builder(pub(crate) NonNull<sys::Builder>);
 
 impl Builder {
-    pub fn new() -> Result<Self> {
-        compatible()?;
+    /// Binds the builder to an open runtime.
+    pub fn new(runtime: &RuntimeHandle) -> Result<Self> {
         let mut out = std::ptr::null_mut();
-        // SAFETY: out points to writable storage.
-        check(unsafe { sys::siphon_builder_new(&mut out) })?;
+        // SAFETY: the runtime is live and out points to writable storage.
+        check(unsafe { sys::siphon_builder_new(runtime.0.as_ptr(), &mut out) })?;
         Ok(Self(handle(out)?))
     }
 
-    /// Retains access for services assembled before the runtime opens.
-    pub fn runtime_handle(&self) -> Result<RuntimeHandle> {
-        let mut result = std::ptr::null();
-        // SAFETY: the builder is live and result is writable.
-        check(unsafe { sys::siphon_builder_runtime(self.0.as_ptr(), &mut result) })?;
-        RuntimeHandle::from_retained(result)
+    /// Enables local command execution for the runtime when it starts.
+    pub fn local_machine(&mut self) -> Result<&mut Self> {
+        // SAFETY: the builder is live and exclusively borrowed.
+        check(unsafe { sys::siphon_builder_local_machine(self.0.as_ptr()) })?;
+        Ok(self)
     }
 
     /// Registers `fiber`. A rejected registration drops its fiber before returning.
@@ -63,37 +60,18 @@ impl Builder {
         Ok(self)
     }
 
-    /// Opens persistent storage, consuming the builder and its registrations. Fibers can run
-    /// resumed processes before this call returns.
-    pub fn open(self, directory: &Path) -> Result<Runtime> {
-        let directory = directory
-            .to_str()
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| Error {
-                code: 2,
-                message: "directory must be nonempty UTF-8".into(),
-            })?;
-        self.open_bytes(directory.as_bytes())
-    }
-
-    /// Opens memory storage, consuming the builder and its registrations.
-    pub fn memory(self) -> Result<Runtime> {
-        self.open_bytes(b"")
-    }
-
-    fn open_bytes(self, directory: &[u8]) -> Result<Runtime> {
+    /// Starts execution, consuming the builder and its registrations. Restored phases may
+    /// run before this call returns.
+    pub fn start(self) -> Result<()> {
         let builder = ManuallyDrop::new(self);
-        let mut out = std::ptr::null_mut();
-        // SAFETY: the native library consumes the builder on all paths. The directory is readable
-        // for this call and out is writable.
-        check(unsafe { sys::siphon_builder_open(builder.0.as_ptr(), slice(directory), &mut out) })?;
-        Runtime::from_open(out)
+        // SAFETY: the native library consumes the builder on all paths.
+        check(unsafe { sys::siphon_builder_start(builder.0.as_ptr()) })
     }
 }
 
 impl Drop for Builder {
     fn drop(&mut self) {
-        // SAFETY: this builder was never passed to open and is released once.
+        // SAFETY: this builder was never passed to start and is released once.
         unsafe { sys::siphon_builder_free(self.0.as_ptr()) };
     }
 }
@@ -222,7 +200,7 @@ pub enum Outcome<O = Bytes> {
 #[derive(Debug)]
 pub struct Run<'a> {
     phase: &'a mut NonNull<sys::Run>,
-    path: &'a [u8],
+    id: FiberId,
     time_ms: i64,
     stop_handler: bool,
     pub changes: Batch<'a>,
@@ -233,13 +211,13 @@ impl<'a> Run<'a> {
     /// Safety: `run` is a live, exclusive native callback handle for this borrow.
     unsafe fn new(phase: &'a mut NonNull<sys::Run>) -> Result<Self> {
         let run = phase.as_ptr();
-        let mut path = sys::Slice::default();
+        let mut id = sys::FiberId::default();
         let mut time_ms = 0;
         let mut stop_handler = 0;
-        check(unsafe { sys::siphon_run_info(run, &mut path, &mut time_ms, &mut stop_handler) })?;
+        check(unsafe { sys::siphon_run_info(run, &mut id, &mut time_ms, &mut stop_handler) })?;
         Ok(Self {
             phase,
-            path: unsafe { borrow_slice(path) },
+            id: unsafe { FiberId::from_view(&id) },
             time_ms,
             stop_handler: stop_handler != 0,
             changes: Batch::new(handle(unsafe { sys::siphon_run_changes(run) })?),
@@ -251,8 +229,8 @@ impl<'a> Run<'a> {
         })
     }
 
-    pub fn path(&self) -> &[u8] {
-        self.path
+    pub fn id(&self) -> &FiberId {
+        &self.id
     }
 
     /// The dispatch time in milliseconds since the Unix epoch.
@@ -343,26 +321,41 @@ impl<'a> Run<'a> {
                 Some(collect_mail),
             )
         };
-        if !present(status)? {
-            return Ok(None);
-        }
-        mail.map(Some).ok_or_else(|| Error {
-            code: 4,
-            message: "Siphon returned no mail for a successful mailbox read".into(),
-        })
+        mailbox_result(status, mail)
     }
 
-    /// Stages removal of the mailbox entry at `key` with the phase's other changes.
-    pub fn discard_mail(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
-        // SAFETY: the phase is live and exclusive, and key is readable for this call.
-        check(unsafe { sys::siphon_run_take_mail(self.phase.as_ptr(), slice(key.as_ref())) })
+    /// Takes the observed mail once per phase, staging its consumption with the phase's changes.
+    /// An absent or already taken entry returns `None`.
+    pub fn take_mail(&mut self, key: &[u8]) -> Result<Option<Mail>> {
+        let mut mail: Option<Mail> = None;
+        // SAFETY: the phase is live and exclusive. The key is readable and the visitor has
+        // exclusive access to mail during this call.
+        let status = unsafe {
+            sys::siphon_run_take_mail(
+                self.phase.as_ptr(),
+                slice(key),
+                std::ptr::from_mut(&mut mail).cast(),
+                Some(collect_mail),
+            )
+        };
+        mailbox_result(status, mail)
     }
 
     /// Starts a direct child of this Fiber in the same commit.
     pub fn start<P: Fiber>(&mut self, key: impl AsRef<[u8]>, input: &P::Input) -> Result<()> {
-        self.changes.start::<P>(self.path, key, input)?;
+        self.changes.start::<P>(Some(&self.id), key, input)?;
         Ok(())
     }
+}
+
+fn mailbox_result(status: sys::Status, mail: Option<Mail>) -> Result<Option<Mail>> {
+    if !present(status)? {
+        return Ok(None);
+    }
+    mail.map(Some).ok_or_else(|| Error {
+        code: 4,
+        message: "Siphon returned no mail for a successful mailbox read".into(),
+    })
 }
 
 unsafe extern "C" fn collect_mail(context: *mut c_void, view: *const sys::MailView) {
@@ -396,7 +389,6 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
         // SAFETY: this is the unique live callback handle for this invocation.
         let mut scoped = unsafe { Run::new(&mut phase)? };
         let ending = fiber.run(&mut scoped, input, checkpoint)?;
-        scoped.changes.ready()?;
         finish(run, ending)?;
         Ok(())
     }));

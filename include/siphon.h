@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 5. All handles are opaque.
+/* Development ABI 6. All handles are opaque.
  * Slices are borrowed for a call. Returned buffers must be freed by this library.
  * Never free or mutate handles concurrently with their use.
  * Runtime calls serialize internally. Snapshot reads are thread-safe.
@@ -15,6 +15,7 @@ extern "C" {
  */
 typedef struct siphon_runtime siphon_runtime;
 typedef struct siphon_snapshot siphon_snapshot;
+typedef struct siphon_revision siphon_revision;
 typedef struct siphon_changes siphon_changes;
 typedef struct siphon_builder siphon_builder;
 typedef struct siphon_run siphon_run;
@@ -27,10 +28,13 @@ typedef struct siphon_command_events siphon_command_events;
 typedef struct { const uint8_t *data; size_t len; } siphon_slice;
 typedef struct { uint8_t *data; size_t len; } siphon_buffer;
 typedef struct { uint32_t code; siphon_buffer error; } siphon_status;
+/* The generation identifies one Fiber at an execution address. */
+typedef struct { siphon_slice path; uint8_t generation[16]; } siphon_fiber_id;
 enum {
     SIPHON_OK = 0, SIPHON_NOT_FOUND, SIPHON_INVALID, SIPHON_CLOSED, SIPHON_FAILED, SIPHON_PANICKED,
     SIPHON_CALLBACK_REENTRY, SIPHON_DENIED, SIPHON_READ_ONLY, SIPHON_EXISTS, SIPHON_UNSUPPORTED,
-    SIPHON_MISSING_PROGRAM, SIPHON_REFUSED, SIPHON_WRITE_ABORTED, SIPHON_REOPEN_REQUIRED
+    SIPHON_MISSING_PROGRAM, SIPHON_REFUSED, SIPHON_WRITE_ABORTED, SIPHON_REOPEN_REQUIRED,
+    SIPHON_CONFLICT, SIPHON_WOULD_BLOCK
 };
 typedef struct {
     siphon_slice key;
@@ -85,6 +89,7 @@ typedef struct {
     uint64_t amount;
 } siphon_counter_view;
 typedef struct {
+    siphon_fiber_id id;
     siphon_slice kind;
     uint32_t version;
     uint64_t created_seq;
@@ -101,14 +106,21 @@ typedef void (*siphon_found_visitor)(void *context, siphon_slice path, siphon_sl
     const siphon_entry_view *entry);
 typedef void (*siphon_journal_visitor)(void *context, const siphon_journal_view *page);
 typedef void (*siphon_fiber_visitor)(void *context, const siphon_fiber_record_view *record);
-typedef void (*siphon_fiber_path_visitor)(void *context, siphon_slice path);
+typedef void (*siphon_fiber_id_visitor)(void *context, const siphon_fiber_id *id);
 typedef void (*siphon_phase_callback)(void *context, siphon_run *run, siphon_slice input, siphon_slice checkpoint);
 typedef void (*siphon_release_callback)(void *context);
-typedef void (*siphon_commit_callback)(void *context, uint64_t seq);
+enum { SIPHON_COMMIT_HEAD = 1, SIPHON_COMMIT_CLOSED, SIPHON_COMMIT_FAULT };
 typedef struct {
-    siphon_slice process;
-    uint64_t started; /* Fiber creation sequence. */
+    uint32_t kind;
+    uint64_t seq;
+    uint32_t status; /* Failure code for Fault. SIPHON_OK for Head and Closed. */
+    siphon_slice error; /* Borrowed UTF-8 failure text, empty for Head and Closed. */
+} siphon_commit_event;
+typedef void (*siphon_commit_callback)(void *context, const siphon_commit_event *event);
+typedef struct {
+    siphon_fiber_id fiber;
     siphon_slice key;
+    uint8_t generation[16];
     uint64_t created_seq; /* Request creation sequence. */
 } siphon_request_id;
 typedef void (*siphon_request_notify)(void *context, uint32_t event);
@@ -145,11 +157,13 @@ typedef struct {
 } siphon_file_stat;
 typedef void (*siphon_file_visitor)(void *context, const siphon_file_stat *stat);
 typedef void (*siphon_dirent_visitor)(void *context, siphon_slice name, uint32_t kind);
-enum { SIPHON_COMMAND_OUTPUT = 1, SIPHON_COMMAND_TITLE, SIPHON_COMMAND_EXIT_CODE, SIPHON_COMMAND_EXIT_SIGNAL };
+enum { SIPHON_COMMAND_OUTPUT = 1, SIPHON_COMMAND_TITLE, SIPHON_COMMAND_EXIT_CODE, SIPHON_COMMAND_EXIT_SIGNAL, SIPHON_COMMAND_GAP };
 typedef struct {
     uint32_t kind;
-    int32_t value;
-    siphon_slice data;
+    int32_t value; /* Exit code or signal number. Zero for other events. */
+    siphon_slice data; /* Output bytes or title text. Empty for Gap and Exit. */
+    uint64_t offset; /* First byte of Output or Gap. Zero for other events. */
+    uint64_t through; /* Exclusive end of Output or Gap. Zero for other events. */
 } siphon_command_view;
 typedef void (*siphon_command_callback)(void *context, const siphon_command_view *event);
 typedef struct {
@@ -172,9 +186,14 @@ enum { SIPHON_ANSWER_GIVEN = 1, SIPHON_ANSWER_FAILED, SIPHON_ANSWER_INTERRUPTED 
 enum { SIPHON_REQUEST_STOP = 1, SIPHON_REQUEST_CLOSED };
 uint32_t siphon_abi_version(void);
 void siphon_buffer_free(siphon_buffer buffer);
-siphon_status siphon_builder_new(siphon_builder **out);
-/* Retains a runtime reference for setup. Operations become available as the builder opens. */
-siphon_status siphon_builder_runtime(const siphon_builder *builder, const siphon_runtime **out);
+/* Opens a volume for state operations. Directory is UTF-8, empty for memory storage.
+ * If journal_entries is null, the volume uses its default retention limit.
+ */
+siphon_status siphon_runtime_open(siphon_slice directory, const uint64_t *journal_entries, siphon_runtime **out);
+/* Binds a builder to this opening without retaining the runtime. */
+siphon_status siphon_builder_new(const siphon_runtime *runtime, siphon_builder **out);
+/* Enables local command execution when the builder starts execution. */
+siphon_status siphon_builder_local_machine(siphon_builder *builder);
 void siphon_builder_free(siphon_builder *builder);
 /* With non-null release, ownership of context transfers on every call, even on error.
  * Context must support concurrent phase invocations. Release runs after all invocations, or on
@@ -184,7 +203,7 @@ void siphon_builder_free(siphon_builder *builder);
  */
 siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, uint32_t version, uint8_t stop_handler,
     uint32_t retries, int64_t delay_min_ms, int64_t delay_max_ms, void *context, siphon_phase_callback run, siphon_release_callback release);
-/* With release, context transfers even on registration error. Keep context ready before open and
+/* With release, context transfers even on registration error. Keep context ready before start and
  * thread-safe for concurrent deliveries. The identity and its byte slices and the payload are valid
  * only during delivery. Copy any data needed by host work and transfer reply to it.
  * Each call owns reply, even if it declines to handle the request. It may return an empty watch.
@@ -200,21 +219,26 @@ siphon_status siphon_builder_handle_request(siphon_builder *builder, siphon_slic
  */
 siphon_status siphon_builder_ask_person(siphon_builder *builder, siphon_slice name, void *context,
     siphon_schema_callback schema, siphon_release_callback release);
-/* Consumes builder on every call; directory is UTF-8, empty for memory storage.
- * Restored phases may invoke their callbacks before this call returns the runtime handle.
- */
-siphon_status siphon_builder_open(siphon_builder *builder, siphon_slice directory, siphon_runtime **out);
+/* Consumes builder on every call. Restored phases may invoke callbacks before it returns. */
+siphon_status siphon_builder_start(siphon_builder *builder);
 /* Blocking runtime calls return status 6 from a callback.
  * Free in that context releases the handle immediately and the runtime shuts down asynchronously.
  */
 siphon_status siphon_runtime_close(const siphon_runtime *runtime);
 /* Free closes the runtime and consumes the reference obtained from open. Retained references
- * may outlive the owner's free call. Release references from retain, builder or reply here.
+ * may outlive the owner's free call. Release retained and reply references with siphon_runtime_release.
  */
 siphon_status siphon_runtime_free(const siphon_runtime *runtime);
 void siphon_runtime_retain(const siphon_runtime *runtime);
 void siphon_runtime_release(const siphon_runtime *runtime);
-siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, uint64_t *seq);
+/* Commit returns an owned receipt for a visible revision. Failure leaves out null.
+ * A revision receipt does not retain the volume. Free it with siphon_revision_free.
+ */
+siphon_status siphon_runtime_commit(const siphon_runtime *runtime, const siphon_changes *changes, siphon_revision **out);
+siphon_status siphon_revision_seq(const siphon_revision *revision, uint64_t *out);
+void siphon_revision_free(siphon_revision *revision);
+/* Confirms the receipt in its original open volume. Through reports the durable sequence. */
+siphon_status siphon_runtime_flush(const siphon_runtime *runtime, const siphon_revision *revision, uint64_t *through);
 siphon_status siphon_runtime_snapshot(const siphon_runtime *runtime, siphon_snapshot **out);
 /* A follower starts with Reset, then replays retained data and follows the topic. */
 siphon_status siphon_runtime_follow(const siphon_runtime *runtime, siphon_slice topic, siphon_following **out);
@@ -242,16 +266,21 @@ siphon_status siphon_namespace_read(const siphon_namespace *namespace_, siphon_s
 siphon_status siphon_namespace_write(const siphon_namespace *namespace_, siphon_slice path, siphon_slice data);
 siphon_status siphon_namespace_mkdir(const siphon_namespace *namespace_, siphon_slice path);
 uint8_t siphon_machine_confines(void);
-/* The JSON spec carries exec, cwd, set, clear, stdio, head_bytes, tail_bytes and log.
- * A command starts within the mounts already configured on namespace_.
+/* Requires siphon_builder_local_machine. A command starts within the mounts configured on namespace_.
+ * Pass the owning Fiber's exact identity, or null to record the command at the runtime root.
+ * The JSON spec carries exec, cwd, set, clear, stdio, head_bytes, tail_bytes and log.
  */
 siphon_status siphon_runtime_spawn(const siphon_runtime *runtime, const siphon_namespace *namespace_,
-    int64_t time, siphon_slice under, siphon_slice spec, siphon_command **command, siphon_command_events **events);
-/* A read transfers context with release on every call. A null event indicates the end. */
+    const siphon_fiber_id *owner, siphon_slice spec, siphon_command **command, siphon_command_events **events);
+/* A read transfers context with release on every call. A null event indicates the end.
+ * Pipes and terminals report skipped live output as Gap. Use siphon_command_read_output for
+ * retained bytes. Coprocesses and channels may wait on a slow reader.
+ */
 siphon_status siphon_command_events_read(const siphon_command_events *events, void *context,
     siphon_command_callback receive, siphon_release_callback release);
 void siphon_command_events_free(siphon_command_events *events);
 void siphon_command_free(siphon_command *command);
+/* Enqueues up to 64 KiB. SIPHON_WOULD_BLOCK means the input queue is full and no bytes were accepted. */
 siphon_status siphon_command_write(const siphon_command *command, siphon_slice data);
 siphon_status siphon_command_close_input(const siphon_command *command);
 siphon_status siphon_command_signal(const siphon_command *command, uint32_t signal);
@@ -263,26 +292,32 @@ siphon_status siphon_command_screen_text(const siphon_command *command, siphon_b
 /* Reads prompts from a snapshot of this volume. Each visitor borrows the view for the call. */
 siphon_status siphon_runtime_person_requests(const siphon_runtime *runtime, const siphon_snapshot *snapshot,
     siphon_slice under, void *context, siphon_person_visitor visit);
-/* Returns status 1 for a missing or replaced request and status 2 for invalid JSON or an unfit answer. */
+/* Returns an owned visible revision. Status 1 means missing or replaced request.
+ * Status 2 means invalid JSON or an unfit answer. Failure leaves out null.
+ */
 siphon_status siphon_runtime_answer(const siphon_runtime *runtime, const siphon_request_id *id,
-    siphon_slice answer, uint64_t *seq);
+    siphon_slice answer, siphon_revision **out);
 /* IDs are UTF-8 UUIDv7 values from the volume. Free the buffer with siphon_buffer_free. */
 siphon_status siphon_runtime_new_id(const siphon_runtime *runtime, siphon_buffer *out);
 siphon_status siphon_runtime_now_ms(const siphon_runtime *runtime, int64_t *out);
-/* Watch delivers its initial sequence before returning success. Subsequent notifications may
- * coalesce commits. The journal supplies change details. With release, ownership of context
- * transfers on every call. A non-null context requires release. Callbacks return promptly and
- * must not unwind or make blocking runtime calls.
+/* Watch delivers its initial event before returning success. Head notifications may coalesce
+ * commits. Closed and Fault carry the final visible sequence and end the subscription. The
+ * journal supplies change details. The event and its error are valid only during the callback.
+ * With release, ownership of context transfers on every call. A non-null context requires
+ * release. Callbacks return promptly and must not unwind or make blocking runtime calls.
  */
 siphon_status siphon_runtime_watch_commits(const siphon_runtime *runtime, void *context,
     siphon_commit_callback notify, siphon_release_callback release, siphon_commit_watch **out);
-/* Requests cancellation. Release runs after the last notification, including during runtime close. */
+/* Frees the watch and requests cancellation. Release runs after the last notification. */
 void siphon_commit_watch_free(siphon_commit_watch *watch);
 siphon_status siphon_changes_new(siphon_changes **out);
+/* Conditions the batch on this snapshot's head without retaining the snapshot. */
+siphon_status siphon_changes_expect(siphon_changes *changes, const siphon_snapshot *snapshot);
 uint8_t siphon_changes_is_empty(const siphon_changes *changes);
 siphon_status siphon_changes_extend(siphon_changes *changes, siphon_changes *other);
-siphon_status siphon_changes_limit(siphon_changes *changes, siphon_slice process, siphon_slice counter, uint64_t maximum);
+siphon_status siphon_changes_limit(siphon_changes *changes, const siphon_fiber_id *fiber, siphon_slice counter, uint64_t maximum);
 void siphon_changes_free(siphon_changes *changes);
+/* Directory and file operations address user data relative to its root. */
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);
 /* The batch copies the metadata pairs during the call. A null, zero-length value removes the name.
  * A non-null, zero-length value sets an empty value. An empty array leaves that metadata group intact.
@@ -296,22 +331,24 @@ siphon_status siphon_changes_seal(siphon_changes *changes, siphon_slice path);
 siphon_status siphon_changes_expire(siphon_changes *changes, siphon_slice path, const int64_t *deadline);
 siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
 siphon_status siphon_process_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
-siphon_status siphon_changes_start(siphon_changes *changes, siphon_slice parent, siphon_slice key, siphon_slice kind,
+/* A null parent starts a root Fiber. A child start resolves the supplied parent identity. */
+siphon_status siphon_changes_start(siphon_changes *changes, const siphon_fiber_id *parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
-/* The batch copies the mail. A non-null started sequence fences delivery to that Fiber incarnation. */
-siphon_status siphon_changes_send(siphon_changes *changes, siphon_slice process, siphon_mail_view mail,
-    const uint64_t *started);
+/* Execution changes copy the Fiber identity and any other byte fields. They resolve
+ * the identity at commit time and reject a missing or replaced instance.
+ */
+siphon_status siphon_changes_send(siphon_changes *changes, const siphon_fiber_id *fiber, siphon_mail_view mail);
 /* Reasons are optional bytes. A null, zero-length slice omits the reason.
  * Remove lets stop handlers run. Force remove kills live Fibers before discarding the subtree.
  */
-siphon_status siphon_changes_signal(siphon_changes *changes, siphon_slice process, uint32_t signal, siphon_slice reason);
-siphon_status siphon_changes_remove(siphon_changes *changes, siphon_slice path, siphon_slice reason);
-siphon_status siphon_changes_force_remove(siphon_changes *changes, siphon_slice path, siphon_slice reason);
-siphon_status siphon_changes_reap(siphon_changes *changes, siphon_slice process);
+siphon_status siphon_changes_signal(siphon_changes *changes, const siphon_fiber_id *fiber, uint32_t signal, siphon_slice reason);
+siphon_status siphon_changes_remove(siphon_changes *changes, const siphon_fiber_id *fiber, siphon_slice reason);
+siphon_status siphon_changes_force_remove(siphon_changes *changes, const siphon_fiber_id *fiber, siphon_slice reason);
+siphon_status siphon_changes_reap(siphon_changes *changes, const siphon_fiber_id *fiber);
 /* The batch copies the counter array and its names during the call. */
-siphon_status siphon_changes_charge(siphon_changes *changes, siphon_slice process,
+siphon_status siphon_changes_charge(siphon_changes *changes, const siphon_fiber_id *fiber,
     const siphon_counter_view *counters, size_t len);
-siphon_status siphon_run_info(const siphon_run *run, siphon_slice *path, int64_t *time_ms, uint8_t *stop_handler);
+siphon_status siphon_run_info(const siphon_run *run, siphon_fiber_id *id, int64_t *time_ms, uint8_t *stop_handler);
 /* Allocates from the same volume inside the phase. Free the buffer with siphon_buffer_free. */
 siphon_status siphon_run_new_id(const siphon_run *run, siphon_buffer *out);
 /* Borrowed for this callback. Do not free, send to other threads, or separately commit. */
@@ -327,16 +364,23 @@ siphon_status siphon_run_cancel_request(siphon_run *run, siphon_slice key);
 siphon_status siphon_run_answer(const siphon_run *run, siphon_slice key, uint32_t *kind, siphon_buffer *payload);
 /* A synchronous visitor borrows the phase's mail. An absent entry returns status 1.
  * The visitor must not unwind or mutate the phase. Mail keys, names and payloads are bytes.
- * Take stages consumption for the phase's commit.
+ * Take stages consumption once for the phase's commit and visits that delivery if visit is set.
+ * Take returns status 1 if the delivery is absent or already taken in this phase.
  */
 siphon_status siphon_run_mail(const siphon_run *run, siphon_slice key, void *context, siphon_mail_visitor visit);
-siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key);
+siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key, void *context, siphon_mail_visitor visit);
 /* Submit a JSON answer, UTF-8 failure or empty interruption. Success only means queued.
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
  */
 siphon_status siphon_reply_submit(const siphon_reply *reply, uint32_t kind, siphon_slice payload);
 /* Retains the delivery's runtime. Release it with siphon_runtime_release. */
 siphon_status siphon_reply_runtime(const siphon_reply *reply, const siphon_runtime **out);
+/* Starts a command owned by this reply's exact request. Uses the same namespace and JSON spec
+ * as siphon_runtime_spawn and requires siphon_builder_local_machine. A closed or interrupted
+ * request refuses new commands. Call from host work outside a Siphon callback.
+ */
+siphon_status siphon_reply_spawn(const siphon_reply *reply, const siphon_namespace *namespace_,
+    siphon_slice spec, siphon_command **command, siphon_command_events **events);
 /* Publishes bytes on a UTF-8 topic for this reply's request. Status 3 means delivery is closed. */
 siphon_status siphon_reply_publish(const siphon_reply *reply, siphon_slice topic, siphon_slice data);
 void siphon_reply_free(siphon_reply *reply);
@@ -378,7 +422,7 @@ siphon_status siphon_snapshot_journal(const siphon_snapshot *snapshot, uint64_t 
 siphon_status siphon_snapshot_fiber(const siphon_snapshot *snapshot, siphon_slice process, void *context,
     siphon_fiber_visitor visit);
 siphon_status siphon_snapshot_fibers(const siphon_snapshot *snapshot, siphon_slice parent, siphon_slice kind,
-    void *context, siphon_fiber_path_visitor visit);
+    void *context, siphon_fiber_id_visitor visit);
 void siphon_snapshot_free(siphon_snapshot *snapshot);
 #ifdef __cplusplus
 }

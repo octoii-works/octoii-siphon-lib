@@ -7,7 +7,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    Builder, Request, RequestId, Result, RuntimeHandle, Snapshot, borrow_slice, check,
+    Builder, Request, RequestId, Result, Revision, RuntimeHandle, Snapshot, borrow_slice, check,
     discard_panic, panic_message, release_context, slice, sys,
 };
 
@@ -62,24 +62,24 @@ impl RuntimeHandle {
         prompts
     }
 
-    /// Commits a person's answer to the exact request, returning the commit sequence.
+    /// Commits a person's answer to the exact request, returning the visible revision.
     /// A missing or replaced request yields code 1. An unfit answer yields code 2.
-    pub async fn answer(&self, id: &RequestId, answer: &Value) -> Result<u64> {
+    pub async fn answer(&self, id: &RequestId, answer: &Value) -> Result<Revision> {
         let (runtime, id, answer) = (self.clone(), id.clone(), answer.clone());
         tokio::task::spawn_blocking(move || runtime.answer_blocking(&id, &answer))
             .await
             .map_err(|error| crate::Error::new(crate::Status::Failed, error.to_string()))?
     }
 
-    pub fn answer_blocking(&self, id: &RequestId, answer: &Value) -> Result<u64> {
-        let mut seq = 0;
+    pub fn answer_blocking(&self, id: &RequestId, answer: &Value) -> Result<Revision> {
+        let mut revision = ptr::null_mut();
         let view = id.view();
         let answer = serde_json::to_vec(answer)?;
-        // SAFETY: all arguments are readable for the call, and seq is writable.
+        // SAFETY: the inputs are readable for the call and the result slot is writable.
         check(unsafe {
-            sys::siphon_runtime_answer(self.0.as_ptr(), &view, slice(&answer), &mut seq)
+            sys::siphon_runtime_answer(self.0.as_ptr(), &view, slice(&answer), &mut revision)
         })?;
-        Ok(seq)
+        Revision::from_owned(revision)
     }
 }
 

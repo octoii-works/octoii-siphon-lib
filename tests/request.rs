@@ -13,8 +13,8 @@ use std::{
 };
 
 use octoii_siphon_lib::{
-    Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, Following, Mail, Options,
-    Outcome, PersonRequest, Published, Request, RequestId, Run, Runtime, Signal, Status,
+    Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, FiberId, Following, Mail,
+    Options, Outcome, PersonRequest, Published, Request, RequestId, Run, Runtime, Signal, Status,
     StreamEvent, Unanswered, Wait, process_path,
 };
 use serde::{Deserialize, Serialize};
@@ -29,17 +29,29 @@ fn host() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Bytes {
-    let mut changes = Changes::new();
-    changes.start::<P>(b"", key, input).unwrap();
+fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> FiberId {
+    let mut changes = Changes::new().unwrap();
+    changes.start::<P>(None, key, input).unwrap();
     runtime.commit_blocking(&changes).unwrap();
-    process_path(b"", key)
+    runtime
+        .snapshot()
+        .unwrap()
+        .fiber(&process_path(b"", key))
+        .unwrap()
+        .unwrap()
+        .id
 }
 
-fn finish<P: Fiber>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
+fn finish<P: Fiber>(runtime: &Runtime, process: &FiberId) -> Outcome<P::Output> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let record = runtime.snapshot().unwrap().fiber(process).unwrap().unwrap();
+        let record = runtime
+            .snapshot()
+            .unwrap()
+            .fiber(process.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&record.id, process);
         if let Some(outcome) = record.decode_outcome::<P>().unwrap() {
             return outcome;
         }
@@ -103,7 +115,7 @@ impl Fiber for Twice {
                 let Some(Answer::Given(first)) = run.answer::<Lookup>(&first_key)? else {
                     panic!("first answer missing");
                 };
-                run.discard_mail(&first_key)?;
+                assert!(run.take_mail(first_key.as_bytes())?.is_some());
                 assert_eq!(
                     run.answer::<Lookup>(&first_key)?,
                     Some(Answer::Given(first))
@@ -129,9 +141,9 @@ impl Fiber for Twice {
                 let Some(Answer::Given(second)) = run.answer::<Lookup>(&second_key)? else {
                     panic!("second answer missing");
                 };
-                run.discard_mail(&second_key)?;
+                run.take_mail(second_key.as_bytes())?;
                 run.changes
-                    .write(b"answers", format!("{first}, {second}").as_bytes());
+                    .write(b"answers", format!("{first}, {second}").as_bytes())?;
                 Ok(Ending::Done((first, second)))
             }
         }
@@ -149,7 +161,7 @@ impl Fiber for Throws {
     fn run(&self, run: &mut Run<'_>, _: (), _: Option<()>) -> anyhow::Result<Ending<(), ()>> {
         let key = run.new_id()?;
         run.request(&key, &Lookup(100))?;
-        run.changes.write(b"throw", b"staged");
+        run.changes.write(b"throw", b"staged")?;
         Err(Error {
             code: 4,
             message: "discard this request".into(),
@@ -162,7 +174,8 @@ impl Fiber for Throws {
 fn phases_commit_ordered_requests_and_discard_thrown_requests() {
     let executor = host();
     let (deliveries, received) = mpsc::channel();
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Throws)
         .unwrap()
@@ -174,7 +187,7 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
             ready(Ok(asked.payload.0 * 2))
         })
         .unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let thrown = start::<Throws>(&runtime, b"throw", &());
     assert!(matches!(
         finish::<Throws>(&runtime, &thrown),
@@ -184,8 +197,8 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
     let (first, first_input) = received.recv_timeout(TIMEOUT).unwrap();
     let (second, second_input) = received.recv_timeout(TIMEOUT).unwrap();
     assert_ne!(first.key(), second.key());
-    assert_eq!(first.path(), process);
-    assert_eq!(second.path(), process);
+    assert_eq!(first.fiber(), &process);
+    assert_eq!(second.fiber(), &process);
     assert_eq!((first_input, second_input), (21, 42));
     assert_eq!(
         finish::<Twice>(&runtime, &process),
@@ -247,7 +260,7 @@ impl Fiber for Once {
             // A stop handler can run before the async host has given its partial result.
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
-        run.discard_mail(&key)?;
+        run.take_mail(key.as_bytes())?;
         if run.is_stop_handler() {
             Ok(Ending::Stopped(Some(answer)))
         } else {
@@ -260,7 +273,8 @@ impl Fiber for Once {
 fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     let executor = host();
     let (started, running) = mpsc::channel();
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Once)
         .unwrap()
@@ -273,26 +287,27 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
             }
         })
         .unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let process = start::<Once>(&runtime, b"stop", &42);
     let request = running.recv_timeout(TIMEOUT).unwrap();
-    assert_eq!(request.path(), process);
-    let mut conflicting = Changes::new();
-    conflicting.send(
-        &process,
-        Mail {
-            key: Bytes::copy_from_slice(request.key()),
-            name: Bytes::from_static(b"ordinary"),
-            payload: Bytes::from_static(b"reserved"),
-        },
-        None,
-    );
+    assert_eq!(request.fiber(), &process);
+    let mut conflicting = Changes::new().unwrap();
+    conflicting
+        .send(
+            &process,
+            Mail {
+                key: Bytes::copy_from_slice(request.key()),
+                name: Bytes::from_static(b"ordinary"),
+                payload: Bytes::from_static(b"reserved"),
+            },
+        )
+        .unwrap();
     let error = runtime.commit_blocking(&conflicting).unwrap_err();
     assert_eq!(error.status(), Status::Refused);
     assert!(error.message.contains("request-pending"), "{error}");
 
-    let mut changes = Changes::new();
-    changes.signal(&process, Signal::Terminate, None);
+    let mut changes = Changes::new().unwrap();
+    changes.signal(&process, Signal::Terminate, None).unwrap();
     runtime.commit_blocking(&changes).unwrap();
     assert_eq!(
         finish::<Once>(&runtime, &process),
@@ -303,17 +318,17 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
     );
 }
 
-fn person_builder() -> Builder {
-    let mut builder = Builder::new().unwrap();
+fn start_person_requests(runtime: &Runtime) {
+    let mut builder = Builder::new(runtime).unwrap();
     builder.fiber(Once).unwrap().ask_person::<Lookup>().unwrap();
-    builder
+    builder.start().unwrap();
 }
 
-fn wait_for_prompt(runtime: &Runtime, process: &[u8]) -> PersonRequest {
+fn wait_for_prompt(runtime: &Runtime, process: &FiberId) -> PersonRequest {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let snapshot = runtime.snapshot().unwrap();
-        let mut prompts = runtime.person_requests(&snapshot, process).unwrap();
+        let mut prompts = runtime.person_requests(&snapshot, process.path()).unwrap();
         if let Some(prompt) = prompts.pop() {
             assert!(prompts.is_empty());
             return prompt;
@@ -329,30 +344,40 @@ fn wait_for_prompt(runtime: &Runtime, process: &[u8]) -> PersonRequest {
 #[test]
 fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = person_builder().open(directory.path()).unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    start_person_requests(&runtime);
     let process = start::<Once>(&runtime, b"person", &42);
     let original = wait_for_prompt(&runtime, &process);
-    assert_eq!(original.id.path(), process);
+    assert_eq!(original.id.fiber(), &process);
     let token = original.id.to_token();
     assert_eq!(original.name, Lookup::NAME.as_bytes());
     assert_eq!(original.payload, b"42");
     assert_eq!(original.answer_schema, serde_json::json!({"const": 42}));
     runtime.close().unwrap();
 
-    let runtime = person_builder().open(directory.path()).unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    start_person_requests(&runtime);
     let standing = runtime.snapshot().unwrap();
     assert_eq!(
         runtime
-            .person_requests(&standing, &process)
+            .person_requests(&standing, process.path())
             .unwrap()
             .as_slice(),
         std::slice::from_ref(&original),
     );
+    let unrelated = process_path(b"", b"unrelated");
     assert!(
         runtime
-            .person_requests(&standing, b"unrelated")
+            .person_requests(&standing, &unrelated)
             .unwrap()
             .is_empty()
+    );
+    assert_eq!(
+        runtime
+            .person_requests(&standing, b"unrelated")
+            .unwrap_err()
+            .status(),
+        octoii_siphon_lib::Status::Invalid
     );
 
     let valid = serde_json::json!(42);
@@ -365,13 +390,14 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     let still_waiting = runtime.snapshot().unwrap();
     assert_eq!(
         runtime
-            .person_requests(&still_waiting, &process)
+            .person_requests(&still_waiting, process.path())
             .unwrap()
             .as_slice(),
         std::slice::from_ref(&original),
     );
 
-    assert!(runtime.answer_blocking(&id, &valid).unwrap() > standing.sequence().unwrap());
+    let answered = runtime.answer_blocking(&id, &valid).unwrap();
+    assert!(answered.seq().unwrap() > standing.sequence().unwrap());
     assert_eq!(
         runtime
             .answer_blocking(&original.id, &valid)
@@ -385,19 +411,22 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     );
     assert!(
         runtime
-            .person_requests(&runtime.snapshot().unwrap(), &process)
+            .person_requests(&runtime.snapshot().unwrap(), process.path())
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        runtime.person_requests(&standing, &process).unwrap(),
+        runtime.person_requests(&standing, process.path()).unwrap(),
         vec![original]
     );
 
-    let mut reap = Changes::new();
-    reap.reap(&process);
+    let mut reap = Changes::new().unwrap();
+    reap.reap(&process).unwrap();
     runtime.commit_blocking(&reap).unwrap();
-    assert_eq!(start::<Once>(&runtime, b"person", &42), process);
+    let replacement = start::<Once>(&runtime, b"person", &42);
+    assert_eq!(replacement.path(), process.path());
+    assert_ne!(replacement, process);
+    let process = replacement;
     let current = wait_for_prompt(&runtime, &process);
     assert_eq!(current.id.path(), id.path());
     assert_eq!(current.id.key(), id.key());
@@ -424,7 +453,8 @@ async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
     let (proceed, wait) = tokio::sync::oneshot::channel();
     let (hold, held) = tokio::sync::oneshot::channel();
     let gates = Mutex::new(Some((published, wait, hold)));
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Once)
         .unwrap()
@@ -441,7 +471,7 @@ async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
             }
         })
         .unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let mut live = runtime.follow("thread").unwrap();
     assert_eq!(next_stream(&mut live).await, Some(StreamEvent::Reset));
     let process = start::<Once>(&runtime, b"streaming", &42);
@@ -449,7 +479,7 @@ async fn stream_waits_can_be_cancelled_and_retain_one_request_through_close() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(id.path(), process);
+    assert_eq!(id.fiber(), &process);
     let part = |offset, data: &[u8]| {
         Some(StreamEvent::Data(Published {
             topic: "thread".into(),
@@ -503,9 +533,17 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     let (release, blocked) = mpsc::channel();
     let (dropped, task_dropped) = mpsc::channel();
     let blocked = Mutex::new(Some(blocked));
-    let mut builder = Builder::new().unwrap();
-    let prepared = builder.runtime_handle().unwrap();
-    assert_eq!(prepared.snapshot().unwrap_err().code, 3);
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    let prepared = runtime.runtime_handle();
+    assert!(
+        prepared
+            .snapshot()
+            .unwrap()
+            .fiber(b"restart")
+            .unwrap()
+            .is_none()
+    );
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Once)
         .unwrap()
@@ -531,13 +569,13 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
             }
         })
         .unwrap();
-    let runtime = builder.open(directory.path()).unwrap();
+    builder.start().unwrap();
     let process = start::<Once>(&runtime, b"restart", &1);
     assert!(
         prepared
             .snapshot()
             .unwrap()
-            .fiber(&process)
+            .fiber(process.path())
             .unwrap()
             .is_some()
     );
@@ -555,7 +593,8 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
     assert_eq!(delivered.snapshot().unwrap_err().code, 3);
 
     let deliveries = Arc::new(AtomicUsize::new(0));
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     let seen = deliveries.clone();
     builder
         .fiber(Once)
@@ -565,7 +604,7 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
             ready(Ok(2))
         })
         .unwrap();
-    let runtime = builder.open(directory.path()).unwrap();
+    builder.start().unwrap();
     assert_eq!(
         finish::<Once>(&runtime, &process),
         Outcome::Completed(Some(Response::Interrupted))
@@ -586,7 +625,8 @@ impl Drop for PanicOnDrop {
 #[test]
 fn host_handler_panics_become_failed_answers() {
     let executor = host();
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Once)
         .unwrap()
@@ -602,7 +642,7 @@ fn host_handler_panics_become_failed_answers() {
             }
         })
         .unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     for (input, expected) in [
         (
             0,
@@ -635,12 +675,11 @@ fn tracked(
 }
 
 #[test]
-fn request_registrations_are_released_on_rejection_and_failed_open() {
-    let directory = tempfile::tempdir().unwrap();
-    let _locked = Builder::new().unwrap().open(directory.path()).unwrap();
+fn request_registrations_are_released_on_rejection_and_failed_start() {
+    let runtime = Runtime::open(None, None).unwrap();
     let executor = host();
     let (released, dropped) = mpsc::channel();
-    let mut builder = Builder::new().unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .handle::<Lookup, _, _>(executor.handle(), tracked(released.clone()))
         .unwrap();
@@ -653,7 +692,219 @@ fn request_registrations_are_released_on_rejection_and_failed_open() {
     );
     dropped.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty));
-    assert!(builder.open(directory.path()).is_err());
+    runtime.close().unwrap();
+    assert_eq!(builder.start().unwrap_err().status(), Status::Closed);
     dropped.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(dropped.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+}
+
+#[cfg(unix)]
+mod machine_requests {
+    use octoii_siphon_lib::{
+        Command, CommandEvent, Exec, Exit, Namespace, RequestCommands, Spec, Stdio,
+    };
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    use super::{
+        Answer, Arc, Asked, Builder, Bytes, Changes, Deserialize, Ending, Fiber, Mail, Outcome,
+        Request, RequestId, Run, Runtime, Serialize, Status, TIMEOUT, Unanswered, Wait, finish,
+        start,
+    };
+
+    const PAGE_KEYS: [&str; 2] = ["cover", "body"];
+
+    #[derive(Deserialize, Serialize)]
+    struct RenderPage(String);
+
+    impl Request for RenderPage {
+        const NAME: &'static str = "contract.render-page";
+        type Answer = String;
+    }
+
+    struct Document;
+
+    impl Fiber for Document {
+        const KIND: &'static str = "contract.document";
+        type Input = ();
+        type Checkpoint = [Option<String>; 2];
+        type Output = String;
+
+        fn run(
+            &self,
+            run: &mut Run<'_>,
+            (): (),
+            checkpoint: Option<Self::Checkpoint>,
+        ) -> anyhow::Result<Ending<Self::Checkpoint, Self::Output>> {
+            if checkpoint.is_none() {
+                run.request("cover", &RenderPage("Draft".into()))?;
+                run.request("body", &RenderPage("Chapters".into()))?;
+            } else if run.take_mail(b"revise")?.is_some() {
+                run.request("cover", &RenderPage("Cover".into()))?;
+            }
+
+            let mut pages = checkpoint.unwrap_or_default();
+            let mut wait = Wait::new().mail(b"revise".as_slice());
+            for (key, page) in PAGE_KEYS.into_iter().zip(&mut pages) {
+                if page.is_some() {
+                    continue;
+                }
+                match run.answer::<RenderPage>(key)? {
+                    Some(Answer::Given(markup)) => {
+                        run.take_mail(key.as_bytes())?;
+                        *page = Some(markup);
+                    }
+                    Some(answer) => anyhow::bail!("{key} did not render: {answer:?}"),
+                    None => wait = wait.mail(key.as_bytes()),
+                }
+            }
+            Ok(match pages {
+                [Some(cover), Some(body)] => Ending::Done(format!("<main>{cover}{body}</main>")),
+                pages => Ending::Wait(pages, wait),
+            })
+        }
+    }
+
+    struct Rendering {
+        id: RequestId,
+        commands: RequestCommands,
+        command: Command,
+        exit: oneshot::Receiver<Exit>,
+    }
+
+    fn renderer(heading: String) -> Spec {
+        let script = r#"IFS= read -r ready && printf '<section><h1>%s</h1></section>' "$1""#;
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+            "render-page".into(),
+            heading,
+        ];
+        Spec {
+            stdio: Some(Stdio::Coprocess),
+            ..Spec::new(Exec::Argv(argv), "/")
+        }
+    }
+
+    async fn render_page(
+        asked: Asked<RenderPage>,
+        namespace: Arc<Namespace>,
+        started: mpsc::UnboundedSender<Rendering>,
+    ) -> anyhow::Result<String> {
+        let commands = asked.commands();
+        let (command, mut events) = commands.spawn(&namespace, &renderer(asked.payload.0))?;
+        let (exited, exit) = oneshot::channel();
+        let rendering = Rendering {
+            id: asked.id,
+            commands,
+            command,
+            exit,
+        };
+        anyhow::ensure!(
+            started.send(rendering).is_ok(),
+            "the test stopped waiting for renderers"
+        );
+
+        // The reader reports exit even if replacement drops the request's handler.
+        tokio::spawn(async move {
+            let mut markup = Vec::new();
+            loop {
+                match events.next().await? {
+                    Some(CommandEvent::Output(chunk)) => {
+                        assert_eq!(chunk.offset, markup.len() as u64);
+                        markup.extend_from_slice(&chunk.bytes);
+                    }
+                    Some(CommandEvent::Exit(exit)) => {
+                        let _ = exited.send(exit);
+                        anyhow::ensure!(exit == Exit::Code(0), "renderer exited with {exit:?}");
+                        return Ok(String::from_utf8(markup)?);
+                    }
+                    other => anyhow::bail!("unexpected renderer event {other:?}"),
+                }
+            }
+        })
+        .await?
+    }
+
+    async fn next_render(started: &mut mpsc::UnboundedReceiver<Rendering>) -> Rendering {
+        timeout(TIMEOUT, started.recv()).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revising_one_page_kills_its_command_and_renders_the_document() {
+        let namespace = Arc::new(Namespace::new().unwrap());
+        namespace.mount_host("", "/", true).unwrap();
+        let (started, mut renders) = mpsc::unbounded_channel();
+        let runtime = Runtime::open(None, None).unwrap();
+        let mut builder = Builder::new(&runtime).unwrap();
+        let render_namespace = Arc::clone(&namespace);
+        builder
+            .local_machine()
+            .unwrap()
+            .fiber(Document)
+            .unwrap()
+            .handle::<RenderPage, _, _>(&tokio::runtime::Handle::current(), move |asked| {
+                let started = started.clone();
+                let namespace = Arc::clone(&render_namespace);
+                async move {
+                    render_page(asked, namespace, started)
+                        .await
+                        .map_err(|error| Unanswered::Failed(error.to_string()))
+                }
+            })
+            .unwrap();
+        builder.start().unwrap();
+        let document = start::<Document>(&runtime, b"document", &());
+
+        let first = next_render(&mut renders).await;
+        let second = next_render(&mut renders).await;
+        let (draft, body) = if first.id.key() == b"cover" {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(draft.id.fiber(), &document);
+        assert_eq!(body.id.fiber(), &document);
+        assert_eq!(draft.id.key(), b"cover");
+        assert_eq!(body.id.key(), b"body");
+
+        let mut revise = Changes::new().unwrap();
+        revise
+            .send(
+                &document,
+                Mail {
+                    key: Bytes::from_static(b"revise"),
+                    name: Bytes::from_static(b"revise"),
+                    payload: Bytes::new(),
+                },
+            )
+            .unwrap();
+        runtime.commit(revise).await.unwrap();
+
+        let cover = next_render(&mut renders).await;
+        assert_eq!(cover.id.fiber(), draft.id.fiber());
+        assert_eq!(cover.id.key(), draft.id.key());
+        assert_ne!(cover.id, draft.id);
+        assert_eq!(
+            timeout(TIMEOUT, draft.exit).await.unwrap().unwrap(),
+            Exit::Signal(9)
+        );
+        drop(draft.command);
+        let stale = draft
+            .commands
+            .spawn(&namespace, &renderer("Stale".into()))
+            .unwrap_err();
+        assert_eq!(stale.status(), Status::Refused);
+
+        body.command.write(b"render\n").unwrap();
+        cover.command.write(b"render\n").unwrap();
+        assert_eq!(
+            finish::<Document>(&runtime, &document),
+            Outcome::Completed(Some(
+                "<main><section><h1>Cover</h1></section><section><h1>Chapters</h1></section></main>".into()
+            ))
+        );
+        runtime.close().unwrap();
+    }
 }

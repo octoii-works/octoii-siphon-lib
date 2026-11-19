@@ -35,6 +35,10 @@ pub struct Snapshot {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct Revision {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct Changes {
     _private: [u8; 0],
 }
@@ -59,6 +63,12 @@ impl Default for Slice {
             len: 0,
         }
     }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FiberId {
+    pub path: Slice,
+    pub generation: [u8; 16],
 }
 #[repr(C)]
 pub struct MailView {
@@ -158,6 +168,7 @@ pub struct CounterView {
 }
 #[repr(C)]
 pub struct FiberRecordView {
+    pub id: FiberId,
     pub kind: Slice,
     pub version: u32,
     pub created_seq: u64,
@@ -170,15 +181,28 @@ pub struct FiberRecordView {
     pub reason: Slice,
 }
 type FiberVisitor = unsafe extern "C" fn(*mut c_void, *const FiberRecordView);
+type FiberIdVisitor = unsafe extern "C" fn(*mut c_void, *const FiberId);
 type JournalVisitor = unsafe extern "C" fn(*mut c_void, *const JournalView);
 type EntryVisitor = unsafe extern "C" fn(*mut c_void, *const EntryView);
 type FoundVisitor = unsafe extern "C" fn(*mut c_void, Slice, Slice, *const EntryView);
 
+pub const COMMIT_HEAD: u32 = 1;
+pub const COMMIT_CLOSED: u32 = 2;
+pub const COMMIT_FAULT: u32 = 3;
+
+#[repr(C)]
+pub struct CommitEvent {
+    pub kind: u32,
+    pub seq: u64,
+    pub status: u32,
+    pub error: Slice,
+}
+
 #[repr(C)]
 pub struct RequestId {
-    pub process: Slice,
-    pub started: u64,
+    pub fiber: FiberId,
     pub key: Slice,
+    pub generation: [u8; 16],
     pub created_seq: u64,
 }
 
@@ -219,11 +243,19 @@ pub struct StreamView {
     pub offset: u64,
     pub data: Slice,
 }
+pub const COMMAND_OUTPUT: u32 = 1;
+pub const COMMAND_TITLE: u32 = 2;
+pub const COMMAND_EXIT_CODE: u32 = 3;
+pub const COMMAND_EXIT_SIGNAL: u32 = 4;
+pub const COMMAND_GAP: u32 = 5;
+
 #[repr(C)]
 pub struct CommandView {
     pub kind: u32,
     pub value: i32,
     pub data: Slice,
+    pub offset: u64,
+    pub through: u64,
 }
 type CommandCallback = unsafe extern "C" fn(*mut c_void, *const CommandView);
 
@@ -261,6 +293,12 @@ pub const OUTCOME_PENDING: u32 = 0;
 pub const OUTCOME_COMPLETED: u32 = 1;
 pub const OUTCOME_FAILED: u32 = 2;
 pub const OUTCOME_STOPPED: u32 = 3;
+pub const SIGNAL_HANGUP: u32 = 1;
+pub const SIGNAL_INTERRUPT: u32 = 2;
+pub const SIGNAL_TERMINATE: u32 = 3;
+pub const SIGNAL_KILL: u32 = 4;
+pub const SIGNAL_STOP: u32 = 5;
+pub const SIGNAL_CONTINUE: u32 = 6;
 pub const ANSWER_GIVEN: u32 = 1;
 pub const ANSWER_FAILED: u32 = 2;
 pub const ANSWER_INTERRUPTED: u32 = 3;
@@ -269,7 +307,7 @@ pub const REQUEST_CLOSED: u32 = 2;
 
 type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, Slice, Slice);
 type ReleaseCallback = unsafe extern "C" fn(*mut c_void);
-type CommitCallback = unsafe extern "C" fn(*mut c_void, u64);
+type CommitCallback = unsafe extern "C" fn(*mut c_void, *const CommitEvent);
 type NotifyCallback = unsafe extern "C" fn(*mut c_void, u32);
 type DeliverCallback =
     unsafe extern "C" fn(*mut c_void, *const RequestId, Slice, *mut Reply) -> Watch;
@@ -277,8 +315,13 @@ type DeliverCallback =
 unsafe extern "C" {
     pub fn siphon_abi_version() -> u32;
     pub fn siphon_buffer_free(buffer: Buffer);
-    pub fn siphon_builder_new(out: *mut *mut Builder) -> Status;
-    pub fn siphon_builder_runtime(builder: *const Builder, out: *mut *const Runtime) -> Status;
+    pub fn siphon_runtime_open(
+        directory: Slice,
+        journal_entries: *const u64,
+        out: *mut *mut Runtime,
+    ) -> Status;
+    pub fn siphon_builder_new(runtime: *const Runtime, out: *mut *mut Builder) -> Status;
+    pub fn siphon_builder_local_machine(builder: *mut Builder) -> Status;
     pub fn siphon_builder_free(builder: *mut Builder);
     pub fn siphon_builder_fiber(
         builder: *mut Builder,
@@ -306,11 +349,7 @@ unsafe extern "C" {
         schema: Option<SchemaCallback>,
         release: Option<ReleaseCallback>,
     ) -> Status;
-    pub fn siphon_builder_open(
-        builder: *mut Builder,
-        directory: Slice,
-        out: *mut *mut Runtime,
-    ) -> Status;
+    pub fn siphon_builder_start(builder: *mut Builder) -> Status;
     pub fn siphon_runtime_close(runtime: *const Runtime) -> Status;
     pub fn siphon_runtime_free(runtime: *const Runtime) -> Status;
     pub fn siphon_runtime_retain(runtime: *const Runtime);
@@ -318,7 +357,14 @@ unsafe extern "C" {
     pub fn siphon_runtime_commit(
         runtime: *const Runtime,
         changes: *const Changes,
-        seq: *mut u64,
+        out: *mut *mut Revision,
+    ) -> Status;
+    pub fn siphon_revision_seq(revision: *const Revision, out: *mut u64) -> Status;
+    pub fn siphon_revision_free(revision: *mut Revision);
+    pub fn siphon_runtime_flush(
+        runtime: *const Runtime,
+        revision: *const Revision,
+        through: *mut u64,
     ) -> Status;
     pub fn siphon_runtime_snapshot(runtime: *const Runtime, out: *mut *mut Snapshot) -> Status;
     pub fn siphon_runtime_follow(
@@ -344,7 +390,7 @@ unsafe extern "C" {
         runtime: *const Runtime,
         id: *const RequestId,
         answer: Slice,
-        seq: *mut u64,
+        out: *mut *mut Revision,
     ) -> Status;
     pub fn siphon_runtime_new_id(runtime: *const Runtime, out: *mut Buffer) -> Status;
     pub fn siphon_runtime_now_ms(runtime: *const Runtime, out: *mut i64) -> Status;
@@ -399,8 +445,7 @@ unsafe extern "C" {
     pub fn siphon_runtime_spawn(
         runtime: *const Runtime,
         namespace: *const Namespace,
-        time: i64,
-        under: Slice,
+        owner: *const FiberId,
         spec: Slice,
         command: *mut *mut Command,
         events: *mut *mut CommandEvents,
@@ -431,11 +476,12 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_command_screen_text(command: *const Command, out: *mut Buffer) -> Status;
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
+    pub fn siphon_changes_expect(changes: *mut Changes, snapshot: *const Snapshot) -> Status;
     pub fn siphon_changes_is_empty(changes: *const Changes) -> u8;
     pub fn siphon_changes_extend(changes: *mut Changes, other: *mut Changes) -> Status;
     pub fn siphon_changes_limit(
         changes: *mut Changes,
-        process: Slice,
+        fiber: *const FiberId,
         counter: Slice,
         maximum: u64,
     ) -> Status;
@@ -458,7 +504,7 @@ unsafe extern "C" {
     pub fn siphon_changes_delete(changes: *mut Changes, path: Slice) -> Status;
     pub fn siphon_changes_start(
         changes: *mut Changes,
-        parent: Slice,
+        parent: *const FiberId,
         key: Slice,
         kind: Slice,
         version: u32,
@@ -466,23 +512,29 @@ unsafe extern "C" {
     ) -> Status;
     pub fn siphon_changes_send(
         changes: *mut Changes,
-        process: Slice,
+        fiber: *const FiberId,
         mail: MailView,
-        started: *const u64,
     ) -> Status;
     pub fn siphon_changes_signal(
         changes: *mut Changes,
-        process: Slice,
+        fiber: *const FiberId,
         signal: u32,
         reason: Slice,
     ) -> Status;
-    pub fn siphon_changes_remove(changes: *mut Changes, path: Slice, reason: Slice) -> Status;
-    pub fn siphon_changes_force_remove(changes: *mut Changes, path: Slice, reason: Slice)
-    -> Status;
-    pub fn siphon_changes_reap(changes: *mut Changes, process: Slice) -> Status;
+    pub fn siphon_changes_remove(
+        changes: *mut Changes,
+        fiber: *const FiberId,
+        reason: Slice,
+    ) -> Status;
+    pub fn siphon_changes_force_remove(
+        changes: *mut Changes,
+        fiber: *const FiberId,
+        reason: Slice,
+    ) -> Status;
+    pub fn siphon_changes_reap(changes: *mut Changes, fiber: *const FiberId) -> Status;
     pub fn siphon_changes_charge(
         changes: *mut Changes,
-        process: Slice,
+        fiber: *const FiberId,
         counters: *const CounterView,
         len: usize,
     ) -> Status;
@@ -532,12 +584,12 @@ unsafe extern "C" {
         parent: Slice,
         kind: Slice,
         context: *mut c_void,
-        visit: Option<unsafe extern "C" fn(*mut c_void, Slice)>,
+        visit: Option<FiberIdVisitor>,
     ) -> Status;
     pub fn siphon_snapshot_free(snapshot: *mut Snapshot);
     pub fn siphon_run_info(
         run: *const Run,
-        path: *mut Slice,
+        id: *mut FiberId,
         time_ms: *mut i64,
         stop_handler: *mut u8,
     ) -> Status;
@@ -558,12 +610,24 @@ unsafe extern "C" {
         context: *mut c_void,
         visit: Option<MailVisitor>,
     ) -> Status;
-    pub fn siphon_run_take_mail(run: *mut Run, key: Slice) -> Status;
+    pub fn siphon_run_take_mail(
+        run: *mut Run,
+        key: Slice,
+        context: *mut c_void,
+        visit: Option<MailVisitor>,
+    ) -> Status;
     pub fn siphon_run_wait_for(run: *mut Run, kind: u32, value: Slice) -> Status;
     pub fn siphon_run_wait_until(run: *mut Run, deadline: i64) -> Status;
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
     pub fn siphon_reply_runtime(reply: *const Reply, out: *mut *const Runtime) -> Status;
+    pub fn siphon_reply_spawn(
+        reply: *const Reply,
+        namespace: *const Namespace,
+        spec: Slice,
+        command: *mut *mut Command,
+        events: *mut *mut CommandEvents,
+    ) -> Status;
     pub fn siphon_reply_free(reply: *mut Reply);
 }

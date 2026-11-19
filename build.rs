@@ -38,7 +38,7 @@ fn main() {
         Some(target.as_str()),
         "Siphon target mismatch"
     );
-    assert_eq!(manifest["abi"].as_u64(), Some(5), "Siphon ABI mismatch");
+    assert_eq!(manifest["abi"].as_u64(), Some(6), "Siphon ABI mismatch");
     let pins: serde_json::Value = serde_json::from_str(include_str!("artifacts.json"))
         .expect("parse the published artifact checksums");
     assert_eq!(

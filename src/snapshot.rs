@@ -6,7 +6,8 @@ use std::{
 use bytes::Bytes;
 
 use crate::{
-    Error, Fiber, Outcome, Result, borrow_slice, check, optional_slice, present, slice, sys, take,
+    Error, Fiber, FiberId, Outcome, Result, borrow_slice, check, optional_slice, present, slice,
+    sys, take,
 };
 
 /// Directory labels and annotations are byte pairs. Sequences refer to committed volume changes.
@@ -98,6 +99,7 @@ pub struct Journal {
 /// A Fiber's identity, committed result, and current reaping eligibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiberRecord {
+    pub id: FiberId,
     pub kind: Bytes,
     pub version: u32,
     pub created_seq: u64,
@@ -182,19 +184,19 @@ impl Snapshot {
     }
 
     /// Lists direct child Fibers of the stated kind. An empty kind lists every child Fiber.
-    pub fn fibers(&self, parent: &[u8], kind: &[u8]) -> Result<Vec<Bytes>> {
-        let mut paths: Vec<Bytes> = Vec::new();
-        // SAFETY: the snapshot and both inputs stay live. The visitor exclusively borrows paths.
+    pub fn fibers(&self, parent: &[u8], kind: &[u8]) -> Result<Vec<FiberId>> {
+        let mut ids: Vec<FiberId> = Vec::new();
+        // SAFETY: the snapshot and both inputs stay live. The visitor exclusively borrows ids.
         check(unsafe {
             sys::siphon_snapshot_fibers(
                 self.as_ptr(),
                 slice(parent),
                 slice(kind),
-                ptr::from_mut(&mut paths).cast(),
-                Some(collect_path),
+                ptr::from_mut(&mut ids).cast(),
+                Some(collect_fiber_id),
             )
         })?;
-        Ok(paths)
+        Ok(ids)
     }
 
     pub fn stat(&self, path: &[u8]) -> Result<Option<Entry>> {
@@ -457,6 +459,8 @@ unsafe fn copy_fiber(view: &sys::FiberRecordView) -> Result<FiberRecord> {
         )
     };
     Ok(FiberRecord {
+        // SAFETY: the record keeps its identity and path live through the visit.
+        id: unsafe { FiberId::from_view(&view.id) },
         kind,
         version: view.version,
         created_seq: view.created_seq,
@@ -476,8 +480,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: Option<&[u8]>) -> Result<Option
     Ok(bytes.map(serde_json::from_slice).transpose()?)
 }
 
-unsafe extern "C" fn collect_path(context: *mut c_void, path: sys::Slice) {
-    // SAFETY: the path is live during the visit and the output is exclusively borrowed.
-    unsafe { &mut *context.cast::<Vec<Bytes>>() }
-        .push(Bytes::copy_from_slice(unsafe { borrow_slice(path) }));
+unsafe extern "C" fn collect_fiber_id(context: *mut c_void, id: *const sys::FiberId) {
+    // SAFETY: the identity and path are live and the visitor holds the output exclusively.
+    unsafe { &mut *context.cast::<Vec<FiberId>>() }.push(unsafe { FiberId::from_view(&*id) });
 }

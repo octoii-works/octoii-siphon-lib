@@ -2,21 +2,27 @@ use bytes::Bytes;
 
 use std::time::Duration;
 
-use octoii_siphon_lib::{Builder, Changes, FileKind, Namespace, Query, Range, Status};
+use octoii_siphon_lib::{
+    Changes, CommitEvent, FileKind, Namespace, Query, Range, Runtime, Snapshot, Status,
+};
 
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
-    let mut first = Changes::new();
-    first.write(b"file", b"one").write(b"empty", b"");
-    let seq = runtime.commit_blocking(&first).unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    let mut first = Changes::new().unwrap();
+    first
+        .write(b"file", b"one")
+        .unwrap()
+        .write(b"empty", b"")
+        .unwrap();
+    let seq = runtime.commit_blocking(&first).unwrap().seq().unwrap();
     let before = runtime.snapshot().unwrap();
     assert!(before.sequence().unwrap() >= seq);
     assert_eq!(before.read(b"empty").unwrap(), Some(Bytes::new()));
     assert_eq!(before.read(b"missing").unwrap(), None);
-    let mut second = Changes::new();
-    second.write(b"file", b"two");
+    let mut second = Changes::new().unwrap();
+    second.write(b"file", b"two").unwrap();
     runtime.commit_blocking(&second).unwrap();
     assert_eq!(
         before.read(b"file").unwrap(),
@@ -30,7 +36,7 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
     );
     drop(before);
     drop(runtime);
-    let reopened = Builder::new().unwrap().open(directory.path()).unwrap();
+    let reopened = Runtime::open(Some(directory.path()), None).unwrap();
     assert_eq!(
         reopened.snapshot().unwrap().read(b"file").unwrap(),
         Some(Bytes::from_static(b"two"))
@@ -38,16 +44,123 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
 }
 
 #[test]
+fn offline_collector_retries_stale_readings_and_flushes_the_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(Some(directory.path()), Some(2)).unwrap();
+    let initial = runtime.snapshot().unwrap().sequence().unwrap();
+
+    let mut seed = Changes::new().unwrap();
+    seed.write(b"total", b"0").unwrap();
+    let seeded = runtime.commit_blocking(&seed).unwrap().seq().unwrap();
+    let north_view = runtime.snapshot().unwrap();
+    let south_view = runtime.snapshot().unwrap();
+    assert_eq!(north_view.sequence().unwrap(), seeded);
+    assert_eq!(south_view.sequence().unwrap(), seeded);
+
+    let collect = |view: &Snapshot, source: &[u8], reading: u64| {
+        let prior = view.read(b"total").unwrap().unwrap();
+        let total = serde_json::from_slice::<u64>(&prior).unwrap() + reading;
+        let mut changes = Changes::new().unwrap();
+        changes
+            .write(source, reading.to_string())
+            .unwrap()
+            .write(b"total", total.to_string())
+            .unwrap()
+            .expect(view)
+            .unwrap();
+        changes
+    };
+    let north = collect(&north_view, b"north", 2);
+    let stale = collect(&south_view, b"south", 3);
+    drop(south_view);
+
+    let north_receipt = runtime.commit_blocking(&north).unwrap();
+    let first = north_receipt.seq().unwrap();
+    assert_eq!(
+        runtime.commit_blocking(&stale).unwrap_err().status(),
+        Status::Conflict
+    );
+    let after_north = runtime.snapshot().unwrap();
+    assert_eq!(after_north.sequence().unwrap(), first);
+    assert_eq!(
+        after_north.read(b"total").unwrap().as_deref(),
+        Some(&b"2"[..])
+    );
+    assert_eq!(after_north.read(b"south").unwrap(), None);
+
+    let south = collect(&after_north, b"south", 3);
+    let south_receipt = runtime.commit_blocking(&south).unwrap();
+    let last = south_receipt.seq().unwrap();
+    let collected = runtime.snapshot().unwrap();
+
+    let north_page = collected.journal(seeded, 1).unwrap();
+    assert!(!north_page.missed);
+    assert_eq!(
+        (north_page.through, north_page.oldest, north_page.latest),
+        (first, Some(first), last)
+    );
+    let south_page = collected.journal(north_page.through, 1).unwrap();
+    assert!(!south_page.missed);
+    assert_eq!(south_page.through, last);
+    for (page, seq, source) in [
+        (&north_page, first, b"north"),
+        (&south_page, last, b"south"),
+    ] {
+        let [entry] = page.change_sets.as_slice() else {
+            panic!("each reading should fill one journal page");
+        };
+        assert_eq!(entry.seq, seq);
+        assert_eq!(entry.paths.len(), 2);
+        assert!(entry.paths.iter().any(|path| path.as_ref() == source));
+        assert!(entry.paths.iter().any(|path| path.as_ref() == b"total"));
+    }
+    let gap = collected.journal(initial, 1).unwrap();
+    assert!(gap.missed);
+    assert_eq!(gap.change_sets, north_page.change_sets);
+    let caught_up = collected.journal(south_page.through, 1).unwrap();
+    assert!(!caught_up.missed);
+    assert!(caught_up.change_sets.is_empty());
+    assert_eq!(caught_up.through, last);
+
+    assert_eq!(runtime.flush(&south_receipt).unwrap(), last);
+    assert_eq!(runtime.flush(&north_receipt).unwrap(), last);
+    runtime.close().unwrap();
+    assert_eq!(
+        north_view.read(b"total").unwrap().as_deref(),
+        Some(&b"0"[..])
+    );
+    assert_eq!(north_view.read(b"north").unwrap(), None);
+    drop((north_view, after_north, collected, runtime));
+
+    let reopened = Runtime::open(Some(directory.path()), Some(2)).unwrap();
+    let snapshot = reopened.snapshot().unwrap();
+    assert_eq!(snapshot.sequence().unwrap(), last);
+    assert_eq!(snapshot.read(b"total").unwrap().as_deref(), Some(&b"5"[..]));
+    assert_eq!(snapshot.read(b"north").unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(snapshot.read(b"south").unwrap().as_deref(), Some(&b"3"[..]));
+    assert_eq!(south_receipt.seq().unwrap(), last);
+    assert_eq!(
+        reopened.flush(&south_receipt).unwrap_err().status(),
+        Status::Invalid
+    );
+}
+
+#[test]
 fn directory_pages_and_entries_are_owned_after_runtime_close() {
-    let runtime = Builder::new().unwrap().memory().unwrap();
-    let mut changes = Changes::new();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut changes = Changes::new().unwrap();
     changes
         .mkdir(b"data")
+        .unwrap()
         .mkdir(b"data/empty")
+        .unwrap()
         .write(b"data/p-b", b"other")
+        .unwrap()
         .write(b"data/p-a", b"")
-        .write(b"data/p\xff", b"raw");
-    let seq = runtime.commit_blocking(&changes).unwrap();
+        .unwrap()
+        .write(b"data/p\xff", b"raw")
+        .unwrap();
+    let seq = runtime.commit_blocking(&changes).unwrap().seq().unwrap();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -122,9 +235,13 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
 
 #[test]
 fn metadata_and_index_pages_follow_their_snapshot() {
-    let runtime = Builder::new().unwrap().memory().unwrap();
-    let mut changes = Changes::new();
-    changes.mkdir(b"team").mkdir(b"team-other");
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut changes = Changes::new().unwrap();
+    changes
+        .mkdir(b"team")
+        .unwrap()
+        .mkdir(b"team-other")
+        .unwrap();
     let entries: &[(&[u8], &[u8])] = &[
         (b"team/item:b", b"ready"),
         (b"team/item:a", b""),
@@ -134,16 +251,22 @@ fn metadata_and_index_pages_follow_their_snapshot() {
     let tag =
         |value: Option<&'static [u8]>| (Bytes::from_static(b"tag"), value.map(Bytes::from_static));
     for &(path, value) in entries {
-        changes.mkdir(path).meta(path, &[tag(Some(value))], &[]);
+        changes
+            .mkdir(path)
+            .unwrap()
+            .meta(path, &[tag(Some(value))], &[])
+            .unwrap();
     }
-    changes.meta(
-        b"team/item:a",
-        &[],
-        &[(
-            Bytes::from_static(b"note"),
-            Some(Bytes::from_static(b"\x00\xff")),
-        )],
-    );
+    changes
+        .meta(
+            b"team/item:a",
+            &[],
+            &[(
+                Bytes::from_static(b"note"),
+                Some(Bytes::from_static(b"\x00\xff")),
+            )],
+        )
+        .unwrap();
     runtime.commit_blocking(&changes).unwrap();
     let before = runtime.snapshot().unwrap();
 
@@ -188,14 +311,16 @@ fn metadata_and_index_pages_follow_their_snapshot() {
     assert_eq!(exact, rest[1..]);
     assert!(before.find(&query, 0).unwrap().is_empty());
 
-    let mut update = Changes::new();
+    let mut update = Changes::new().unwrap();
     update
         .meta(
             b"team/item:a",
             &[tag(None)],
             &[(Bytes::from_static(b"note"), None)],
         )
-        .meta(b"team/item:b", &[tag(Some(b""))], &[]);
+        .unwrap()
+        .meta(b"team/item:b", &[tag(Some(b""))], &[])
+        .unwrap();
     runtime.commit_blocking(&update).unwrap();
     let after = runtime.snapshot().unwrap();
     runtime.close().unwrap();
@@ -220,7 +345,7 @@ fn metadata_and_index_pages_follow_their_snapshot() {
 
 #[test]
 fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
-    let runtime = Builder::new().unwrap().memory().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
     let initial = runtime.snapshot().unwrap().journal(0, 1).unwrap();
     assert!(initial.change_sets.is_empty());
     assert_eq!(
@@ -229,16 +354,24 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
     );
     assert!(!initial.missed);
 
-    let mut write = Changes::new();
-    write.write(b"raw\xff", b"one");
-    let first = runtime.commit_blocking(&write).unwrap();
+    let mut write = Changes::new().unwrap();
+    write.write(b"raw\xff", b"one").unwrap();
+    let first = runtime.commit_blocking(&write).unwrap().seq().unwrap();
     let retained = runtime.snapshot().unwrap();
-    let empty = runtime.commit_blocking(&Changes::new()).unwrap();
+    let empty = runtime
+        .commit_blocking(&Changes::new().unwrap())
+        .unwrap()
+        .seq()
+        .unwrap();
     assert!(empty > first);
 
-    let mut rewrite = Changes::new();
-    rewrite.delete(b"raw\xff").write(b"new", b"two");
-    let last = runtime.commit_blocking(&rewrite).unwrap();
+    let mut rewrite = Changes::new().unwrap();
+    rewrite
+        .delete(b"raw\xff")
+        .unwrap()
+        .write(b"new", b"two")
+        .unwrap();
+    let last = runtime.commit_blocking(&rewrite).unwrap().seq().unwrap();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -284,7 +417,7 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
 #[test]
 fn volume_ids_and_file_retention_survive_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
     let first = runtime.new_id().unwrap();
     assert_eq!(first.len(), 36);
     assert_eq!(first.as_bytes()[14], b'7');
@@ -292,11 +425,14 @@ fn volume_ids_and_file_retention_survive_reopening() {
     assert!(now > 0);
     let deadline = now + 60_000;
 
-    let mut changes = Changes::new();
+    let mut changes = Changes::new().unwrap();
     changes
         .write(b"log", b"first")
+        .unwrap()
         .seal(b"log")
-        .expire(b"log", Some(deadline));
+        .unwrap()
+        .expire(b"log", Some(deadline))
+        .unwrap();
     runtime.commit_blocking(&changes).unwrap();
     let before = runtime.snapshot().unwrap();
     assert_eq!(
@@ -304,14 +440,14 @@ fn volume_ids_and_file_retention_survive_reopening() {
         Some(deadline)
     );
 
-    let mut blocked = Changes::new();
-    blocked.append(b"log", b"later");
+    let mut blocked = Changes::new().unwrap();
+    blocked.append(b"log", b"later").unwrap();
     assert_eq!(
         runtime.commit_blocking(&blocked).unwrap_err().status(),
         Status::ReadOnly
     );
-    let mut clear = Changes::new();
-    clear.expire(b"log", None);
+    let mut clear = Changes::new().unwrap();
+    clear.expire(b"log", None).unwrap();
     runtime.commit_blocking(&clear).unwrap();
     let after = runtime.snapshot().unwrap();
     assert_eq!(
@@ -329,7 +465,7 @@ fn volume_ids_and_file_retention_survive_reopening() {
     assert_eq!(runtime.now_ms().unwrap_err().code, 3);
     drop((before, after, runtime));
 
-    let reopened = Builder::new().unwrap().open(directory.path()).unwrap();
+    let reopened = Runtime::open(Some(directory.path()), None).unwrap();
     assert!(reopened.new_id().unwrap() > first);
     assert_eq!(
         reopened
@@ -348,18 +484,20 @@ fn volume_ids_and_file_retention_survive_reopening() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
-    let runtime = Builder::new().unwrap().memory().unwrap();
-    let mut watch = runtime.committed().unwrap();
-    assert_eq!(
+async fn commit_subscription_reports_progress_and_closes_with_its_runtime() {
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut watch = runtime.commits().unwrap();
+    let initial = runtime.snapshot().unwrap().sequence().unwrap();
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
+            .unwrap()
             .unwrap(),
-        Some(runtime.snapshot().unwrap().sequence().unwrap())
-    );
+        Some(CommitEvent::Head(seq)) if seq == initial
+    ));
 
-    let mut rejected = Changes::new();
-    rejected.write(b"absent/child", b"no");
+    let mut rejected = Changes::new().unwrap();
+    rejected.write(b"absent/child", b"no").unwrap();
     assert!(runtime.commit_blocking(&rejected).is_err());
     assert!(
         tokio::time::timeout(Duration::from_millis(25), watch.next())
@@ -367,62 +505,79 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
             .is_err()
     );
 
-    let mut batch = Changes::new();
-    batch.write(b"file", b"one");
-    let first = runtime.commit_blocking(&batch).unwrap();
-    assert_eq!(
+    let mut batch = Changes::new().unwrap();
+    batch.write(b"file", b"one").unwrap();
+    let first = runtime.commit(batch).await.unwrap().seq().unwrap();
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
             .unwrap()
             .unwrap(),
-        first
-    );
+        Some(CommitEvent::Head(seq)) if seq == first
+    ));
 
-    let mut cancelled = runtime.committed().unwrap();
-    assert_eq!(
+    let mut cancelled = runtime.commits().unwrap();
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), cancelled.next())
             .await
+            .unwrap()
             .unwrap(),
-        Some(first)
-    );
+        Some(CommitEvent::Head(seq)) if seq == first
+    ));
     drop(cancelled);
-    let mut next = Changes::new();
-    next.write(b"file", b"two");
-    let second = runtime.commit_blocking(&next).unwrap();
-    assert_eq!(
+    let mut next = Changes::new().unwrap();
+    next.write(b"file", b"two").unwrap();
+    let second = runtime.commit(next).await.unwrap().seq().unwrap();
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
             .unwrap()
             .unwrap(),
-        second
-    );
+        Some(CommitEvent::Head(seq)) if seq == second
+    ));
     let journal = runtime.snapshot().unwrap().journal(first, 1).unwrap();
     assert_eq!(journal.through, second);
     assert_eq!(journal.change_sets[0].paths, [b"file".to_vec()]);
 
     runtime.close().unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), watch.next())
-        .await
-        .unwrap();
-    assert_eq!(closed, None);
-    assert_eq!(runtime.committed().unwrap_err().code, 3);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(CommitEvent::Closed(seq)) if seq == second
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(runtime.commits().unwrap_err().code, 3);
 }
 
 #[test]
 fn a_failed_batch_does_not_commit_earlier_writes() {
-    let runtime = Builder::new().unwrap().memory().unwrap();
-    let mut batch = Changes::new();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut batch = Changes::new().unwrap();
     let tag = |value: &'static [u8]| (Bytes::from_static(b"tag"), Some(Bytes::from_static(value)));
     batch
         .write(b"file", b"before")
+        .unwrap()
         .mkdir(b"record")
-        .meta(b"record", &[tag(b"before")], &[]);
+        .unwrap()
+        .meta(b"record", &[tag(b"before")], &[])
+        .unwrap();
     runtime.commit_blocking(&batch).unwrap();
-    let mut invalid = Changes::new();
+    let mut invalid = Changes::new().unwrap();
     invalid
         .write(b"file", b"after")
+        .unwrap()
         .meta(b"record", &[tag(b"after")], &[])
-        .write(b"missing/child", b"bad");
+        .unwrap()
+        .write(b"missing/child", b"bad")
+        .unwrap();
     assert!(runtime.commit_blocking(&invalid).is_err());
     let snapshot = runtime.snapshot().unwrap();
     assert_eq!(
@@ -446,8 +601,8 @@ fn a_failed_batch_does_not_commit_earlier_writes() {
 async fn failure_cleanup_and_drop_work_inside_an_async_host() {
     let directory = tempfile::tempdir().unwrap();
     for _ in 0..10 {
-        let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
-        let error = Builder::new().unwrap().open(directory.path()).unwrap_err();
+        let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+        let error = Runtime::open(Some(directory.path()), None).unwrap_err();
         assert_ne!(error.code, 5, "locked directory must not panic");
         drop(runtime);
     }
@@ -481,10 +636,11 @@ fn a_namespace_mounts_host_and_read_only_volume_views() {
     assert_eq!(names.len(), 1);
     assert_eq!(names[0].name.as_ref(), b"one");
 
-    let runtime = Builder::new().unwrap().memory().unwrap();
-    let mut changes = Changes::new();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut changes = Changes::new().unwrap();
     changes
         .mkdir(b"document:first")
+        .unwrap()
         .meta(
             b"document:first",
             &[(
@@ -493,7 +649,9 @@ fn a_namespace_mounts_host_and_read_only_volume_views() {
             )],
             &[],
         )
-        .write(b"document:first/note", b"from the volume");
+        .unwrap()
+        .write(b"document:first/note", b"from the volume")
+        .unwrap();
     runtime.commit_blocking(&changes).unwrap();
     namespace
         .mount_labels(&runtime, "documents", "document", "visible", b"")

@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use octoii_siphon_lib::Snapshot;
 
 use std::{
     panic::panic_any,
@@ -14,7 +13,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome, Query, Range, Run, Runtime,
-    Signal, Wait, process_path,
+    Signal, Snapshot, Status, Wait, process_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,8 +40,8 @@ fn finished(runtime: &Runtime, path: &[u8]) -> octoii_siphon_lib::OwnedSnapshot 
 }
 
 fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Bytes {
-    let mut changes = Changes::new();
-    changes.start::<P>(b"", key, input).unwrap();
+    let mut changes = Changes::new().unwrap();
+    changes.start::<P>(None, key, input).unwrap();
     runtime.commit_blocking(&changes).unwrap();
     process_path(b"", key)
 }
@@ -62,10 +61,11 @@ impl Fiber for Parent {
         (label, start): Self::Input,
         checkpoint: Option<u32>,
     ) -> anyhow::Result<Ending<u32, Self::Output>> {
-        assert_eq!(run.path(), process_path(b"", b"parent"));
+        assert_eq!(run.id().path(), process_path(b"", b"parent"));
         assert!(run.time_ms() > 0 && run.snapshot().sequence()? > 0);
         assert!(!run.is_stop_handler());
-        let record = run.snapshot().fiber(run.path())?.unwrap();
+        let record = run.snapshot().fiber(run.id().path())?.unwrap();
+        assert_eq!(&record.id, run.id());
         assert_eq!(record.kind, Self::KIND.as_bytes());
         assert_eq!(record.version, Self::VERSION);
         assert!(!record.reapable);
@@ -78,7 +78,7 @@ impl Fiber for Parent {
         match checkpoint {
             None => {
                 run.changes
-                    .mkdir(b"gate")
+                    .mkdir(b"gate")?
                     .meta(
                         b"gate",
                         &[(
@@ -86,8 +86,8 @@ impl Fiber for Parent {
                             Some(Bytes::copy_from_slice(b"ready")),
                         )],
                         &[],
-                    )
-                    .write(b"log", b"next");
+                    )?
+                    .write(b"log", b"next")?;
                 assert_eq!(run.snapshot().read(b"log")?, None);
                 assert!(run.snapshot().find(&gate, 1)?.is_empty());
                 Ok(Ending::Next(start))
@@ -103,12 +103,7 @@ impl Fiber for Parent {
                     .expect("the previous phase wrote log");
                 assert_eq!(entry.length, 4);
                 assert!(entry.directory.is_none());
-                let own = run.snapshot().stat(run.path())?.unwrap().directory.unwrap();
-                assert!(
-                    own.labels
-                        .iter()
-                        .any(|(_, value)| value == Self::KIND.as_bytes())
-                );
+                assert_eq!(run.snapshot().stat(run.id().path())?, None);
                 let page = run.snapshot().list(
                     b"gate",
                     &Range {
@@ -121,7 +116,7 @@ impl Fiber for Parent {
                     run.snapshot().read_range(b"log", 1, 2)?,
                     Some(Bytes::from_static(b"ex"))
                 );
-                run.changes.append(b"log", b" change");
+                run.changes.append(b"log", b" change")?;
                 Ok(Ending::Wait(
                     value + 1,
                     Wait::new().change(b"gate").deadline(run.time_ms() + 60_000),
@@ -132,15 +127,13 @@ impl Fiber for Parent {
                     run.snapshot().read(b"gate/signal")?,
                     Some(Bytes::from_static(b"go"))
                 );
-                let parent = run.path().to_vec();
-                run.changes
-                    .delete(b"gate/signal")
-                    .start::<Child>(&parent, b"child", &value)?;
-                run.changes.append(b"log", b" child");
+                run.changes.delete(b"gate/signal")?;
+                run.start::<Child>(b"child", &value)?;
+                run.changes.append(b"log", b" child")?;
                 Ok(Ending::Wait(value + 1, Wait::new().child(b"child")))
             }
             Some(value) if value == start + 2 => {
-                let child = process_path(run.path(), b"child");
+                let child = process_path(run.id().path(), b"child");
                 assert_eq!(
                     run.snapshot()
                         .fiber(&child)?
@@ -148,7 +141,7 @@ impl Fiber for Parent {
                         .decode_outcome::<Child>()?,
                     Some(Outcome::Completed(Some(value)))
                 );
-                run.changes.append(b"log", b" deadline");
+                run.changes.append(b"log", b" deadline")?;
                 Ok(Ending::Wait(
                     value + 1,
                     Wait::new().deadline(run.time_ms() + 10),
@@ -156,7 +149,7 @@ impl Fiber for Parent {
             }
             Some(value) => {
                 assert_eq!(value, start + 3);
-                run.changes.append(b"log", b" done");
+                run.changes.append(b"log", b" done")?;
                 Ok(Ending::Done((label, value)))
             }
         }
@@ -179,9 +172,10 @@ impl Fiber for Child {
 #[test]
 fn checkpoints_waits_and_phase_writes_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Parent).unwrap().fiber(Child).unwrap();
-    let runtime = builder.open(directory.path()).unwrap();
+    builder.start().unwrap();
     let path = process_path(b"", b"parent");
     assert_eq!(runtime.snapshot().unwrap().fiber(&path).unwrap(), None);
     assert_eq!(
@@ -199,32 +193,36 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     assert!(record.waits_until.is_some_and(|deadline| deadline > 0));
     assert!(!record.reapable);
     assert_eq!(record.decode_outcome::<Child>().unwrap_err().code, 2);
-    let mut wake = Changes::new();
-    wake.write(b"gate/signal", b"go");
-    runtime.commit_blocking(&wake).unwrap();
+    runtime.close().unwrap();
+    let log_before_wake = Some(Bytes::from_static(b"next change"));
+    assert_eq!(waiting.read(b"log").unwrap(), log_before_wake);
+    drop((waiting, runtime));
+
+    let runtime = Runtime::open(Some(directory.path()), None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
+    builder.fiber(Parent).unwrap().fiber(Child).unwrap();
+    let mut wake = Changes::new().unwrap();
+    wake.write(b"gate/signal", b"go").unwrap();
+    let wake_seq = runtime.commit_blocking(&wake).unwrap().seq().unwrap();
+    let before_start = runtime.snapshot().unwrap();
+    assert_eq!(before_start.sequence().unwrap(), wake_seq);
+    assert_eq!(before_start.read(b"log").unwrap(), log_before_wake);
+    assert_eq!(before_start.fiber(&path).unwrap().unwrap().id, record.id);
+    builder.start().unwrap();
 
     let completed = Some(Outcome::Completed(Some(("answer".into(), 45))));
     let log = Some(Bytes::from_static(b"next change child deadline done"));
     let finished = finished(&runtime, &path);
-    assert_eq!(
-        finished
-            .fiber(&path)
-            .unwrap()
-            .unwrap()
-            .decode_outcome::<Parent>()
-            .unwrap(),
-        completed
-    );
+    let ended = finished.fiber(&path).unwrap().unwrap();
+    assert_eq!(ended.id, record.id);
+    assert_eq!(ended.decode_outcome::<Parent>().unwrap(), completed);
     assert_eq!(finished.read(b"log").unwrap(), log);
     assert_eq!(finished.read(b"gate/signal").unwrap(), None);
-    assert_eq!(
-        waiting.read(b"log").unwrap(),
-        Some(Bytes::from_static(b"next change"))
-    );
+    assert_eq!(before_start.read(b"log").unwrap(), log_before_wake);
     runtime.close().unwrap();
-    drop((waiting, finished, runtime));
+    drop((before_start, finished, runtime));
 
-    let reopened = Builder::new().unwrap().open(directory.path()).unwrap();
+    let reopened = Runtime::open(Some(directory.path()), None).unwrap();
     let snapshot = reopened.snapshot().unwrap();
     assert_eq!(
         snapshot
@@ -254,22 +252,23 @@ impl Fiber for VolumeIds {
     ) -> anyhow::Result<Ending<(), Self::Output>> {
         let id = run.new_id()?;
         let deadline = run.time_ms() + 60_000;
-        let process = run.path().to_vec();
+        let id_of_run = run.id().clone();
         run.changes
-            .charge(&process, [(Bytes::from_static(b"phase-units"), 4)]);
+            .charge(&id_of_run, [(Bytes::from_static(b"phase-units"), 4)])?;
         run.changes
-            .write(b"phase-id", id.as_bytes())
-            .seal(b"phase-id")
-            .expire(b"phase-id", Some(deadline));
+            .write(b"phase-id", id.as_bytes())?
+            .seal(b"phase-id")?
+            .expire(b"phase-id", Some(deadline))?;
         Ok(Ending::Done((id, deadline)))
     }
 }
 
 #[test]
 fn a_phase_and_its_runtime_allocate_from_the_same_volume() {
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(VolumeIds).unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let before = runtime.new_id().unwrap();
     let path = start::<VolumeIds>(&runtime, b"work", &());
     let snapshot = finished(&runtime, &path);
@@ -298,8 +297,8 @@ fn a_phase_and_its_runtime_allocate_from_the_same_volume() {
         snapshot.stat(b"phase-id").unwrap().unwrap().expires_at,
         Some(deadline)
     );
-    let mut append = Changes::new();
-    append.append(b"phase-id", b"forbidden");
+    let mut append = Changes::new().unwrap();
+    append.append(b"phase-id", b"forbidden").unwrap();
     assert!(runtime.commit_blocking(&append).is_err());
 }
 
@@ -319,7 +318,7 @@ impl Fiber for ReceivesMail {
         (): (),
         consumed: Option<bool>,
     ) -> anyhow::Result<Ending<bool, ()>> {
-        let incoming = run.mail(MAIL_KEY)?;
+        let incoming = run.take_mail(MAIL_KEY)?;
         if consumed == Some(true) {
             assert_eq!(incoming, None);
             assert_eq!(
@@ -333,15 +332,14 @@ impl Fiber for ReceivesMail {
             return Ok(Ending::Done(()));
         }
         let Some(mail) = incoming else {
-            run.changes.write(b"mail-ready", b"yes");
+            run.changes.write(b"mail-ready", b"yes")?;
             return Ok(Ending::Wait(false, Wait::new().mail(MAIL_KEY)));
         };
         assert_eq!(mail.key, MAIL_KEY);
         assert_eq!(mail.name, Bytes::from_static(b"notice\xfe"));
         assert_eq!(mail.payload, Bytes::from_static(b"\x00\xff"));
-        let process = run.path().to_vec();
-        let started = run.snapshot().fiber(&process)?.unwrap().created_seq;
-        run.discard_mail(MAIL_KEY)?;
+        assert_eq!(run.take_mail(MAIL_KEY)?, None);
+        let process = run.id().clone();
         run.changes.send(
             &process,
             Mail {
@@ -349,8 +347,7 @@ impl Fiber for ReceivesMail {
                 name: Bytes::from_static(b"received"),
                 payload: Bytes::new(),
             },
-            Some(started),
-        );
+        )?;
         assert_eq!(run.mail(MAIL_KEY)?, Some(mail));
         assert_eq!(run.mail(b"ack")?, None);
         Ok(Ending::Next(true))
@@ -359,34 +356,53 @@ impl Fiber for ReceivesMail {
 
 #[test]
 fn byte_keyed_mail_wakes_the_right_fiber_and_is_consumed_on_commit() {
-    let mut builder = Builder::new().unwrap();
-    builder.fiber(ReceivesMail).unwrap();
-    let runtime = builder.memory().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
+    builder.fiber(Child).unwrap().fiber(ReceivesMail).unwrap();
+    builder.start().unwrap();
+    let previous = start::<Child>(&runtime, b"receiver", &0);
+    let old_id = finished(&runtime, &previous)
+        .fiber(&previous)
+        .unwrap()
+        .unwrap()
+        .id;
+    let mut reap = Changes::new().unwrap();
+    reap.reap(&old_id).unwrap();
+    runtime.commit_blocking(&reap).unwrap();
+
     let process = start::<ReceivesMail>(&runtime, b"receiver", &());
     let waiting = until(&runtime, |snapshot| {
         snapshot.read(b"mail-ready").unwrap().is_some()
     });
-    let started = waiting.fiber(&process).unwrap().unwrap().created_seq;
+    let id = waiting.fiber(&process).unwrap().unwrap().id;
+    assert_eq!(id.path(), old_id.path());
+    assert_ne!(id, old_id);
+    assert_eq!(
+        waiting.fibers(b"", ReceivesMail::KIND.as_bytes()).unwrap(),
+        std::slice::from_ref(&id)
+    );
     let mail = Mail {
         key: Bytes::from_static(MAIL_KEY),
         name: Bytes::from_static(b"notice\xfe"),
         payload: Bytes::from_static(b"\x00\xff"),
     };
-    let mut stale = Changes::new();
+    let mut stale = Changes::new().unwrap();
     stale
         .write(b"rolled-back", b"no")
-        .send(&process, mail.clone(), Some(started + 1));
+        .unwrap()
+        .send(&old_id, mail.clone())
+        .unwrap();
     assert_eq!(
         runtime.commit_blocking(&stale).unwrap_err().status(),
-        octoii_siphon_lib::Status::Refused
+        Status::Refused
     );
     assert_eq!(
         runtime.snapshot().unwrap().read(b"rolled-back").unwrap(),
         None
     );
 
-    let mut send = Changes::new();
-    send.send(&process, mail.clone(), Some(started));
+    let mut send = Changes::new().unwrap();
+    send.send(&id, mail).unwrap();
     runtime.commit_blocking(&send).unwrap();
     assert_eq!(
         finished(&runtime, &process)
@@ -408,10 +424,8 @@ impl Fiber for ExitsFirst {
     type Output = ();
 
     fn run(&self, run: &mut Run<'_>, (): (), _: Option<()>) -> anyhow::Result<Ending<(), ()>> {
-        let parent = run.path().to_vec();
-        run.changes
-            .mkdir(b"exit-gate")
-            .start::<WaitsForRelease>(&parent, b"child", &())?;
+        run.changes.mkdir(b"exit-gate")?;
+        run.start::<WaitsForRelease>(b"child", &())?;
         Ok(Ending::Done(()))
     }
 }
@@ -434,13 +448,14 @@ impl Fiber for WaitsForRelease {
 
 #[test]
 fn a_recorded_outcome_can_precede_reaping_eligibility() {
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(ExitsFirst)
         .unwrap()
         .fiber(WaitsForRelease)
         .unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let path = start::<ExitsFirst>(&runtime, b"parent", &());
     let exiting = until(&runtime, |snapshot| {
         snapshot
@@ -455,8 +470,8 @@ fn a_recorded_outcome_can_precede_reaping_eligibility() {
         Some(Outcome::Completed(Some(())))
     );
 
-    let mut wake = Changes::new();
-    wake.write(b"exit-gate/release", b"go");
+    let mut wake = Changes::new().unwrap();
+    wake.write(b"exit-gate/release", b"go").unwrap();
     runtime.commit_blocking(&wake).unwrap();
     let ended = finished(&runtime, &path).fiber(&path).unwrap().unwrap();
     assert!(ended.reapable);
@@ -488,11 +503,11 @@ impl Fiber for Stoppable {
                 run.snapshot().read(b"stoppable")?,
                 Some(Bytes::from_static(b"waiting"))
             );
-            run.changes.write(b"stoppable", b"stopped");
+            run.changes.write(b"stoppable", b"stopped")?;
             return Ok(Ending::Stopped(checkpoint));
         }
         assert_eq!(checkpoint, None);
-        run.changes.write(b"stoppable", b"waiting");
+        run.changes.write(b"stoppable", b"waiting")?;
         Ok(Ending::Wait(
             input,
             Wait::new().deadline(run.time_ms() + 60_000),
@@ -502,28 +517,32 @@ impl Fiber for Stoppable {
 
 #[test]
 fn a_waiting_process_preserves_its_stop_handler_result() {
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Stoppable).unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     let path = start::<Stoppable>(&runtime, b"stop", &"partial output".into());
-    until(&runtime, |snapshot| {
+    let waiting = until(&runtime, |snapshot| {
         snapshot.read(b"stoppable").unwrap().is_some()
     });
-    let mut premature = Changes::new();
-    premature.reap(&path);
+    let id = waiting.fiber(&path).unwrap().unwrap().id;
+    let mut premature = Changes::new().unwrap();
+    premature.reap(&id).unwrap();
     assert_eq!(
         runtime.commit_blocking(&premature).unwrap_err().status(),
-        octoii_siphon_lib::Status::Refused
+        Status::Refused
     );
 
-    let mut changes = Changes::new();
+    let mut changes = Changes::new().unwrap();
     changes
-        .charge(&path, [(Bytes::from_static(b"units"), 9)])
+        .charge(&id, [(Bytes::from_static(b"units"), 9)])
+        .unwrap()
         .signal(
-            &path,
+            &id,
             Signal::Terminate,
             Some(Bytes::from_static(b"test stop")),
-        );
+        )
+        .unwrap();
     runtime.commit_blocking(&changes).unwrap();
 
     let stopped = finished(&runtime, &path);
@@ -541,49 +560,82 @@ fn a_waiting_process_preserves_its_stop_handler_result() {
     );
     assert!(record.usage.contains(&(Bytes::from_static(b"units"), 9)));
 
-    let mut reap = Changes::new();
-    reap.reap(&path);
+    let mut reap = Changes::new().unwrap();
+    reap.reap(&id).unwrap();
     runtime.commit_blocking(&reap).unwrap();
     assert_eq!(runtime.snapshot().unwrap().fiber(&path).unwrap(), None);
     assert_eq!(stopped.fiber(&path).unwrap(), Some(record));
 }
 
+struct RemovalParent;
+
+impl Fiber for RemovalParent {
+    const KIND: &'static str = "contract.removal-parent";
+    type Input = ();
+    type Checkpoint = ();
+    type Output = ();
+
+    fn run(
+        &self,
+        run: &mut Run<'_>,
+        (): (),
+        checkpoint: Option<()>,
+    ) -> anyhow::Result<Ending<(), ()>> {
+        if checkpoint.is_some() {
+            return Ok(Ending::Done(()));
+        }
+        run.start::<Stoppable>(b"child", &"partial output".into())?;
+        Ok(Ending::Wait((), Wait::new().child(b"child")))
+    }
+}
+
 #[test]
 fn graceful_removal_runs_stop_handlers_and_force_removal_kills_the_subtree() {
-    let mut builder = Builder::new().unwrap();
-    builder.fiber(Stoppable).unwrap();
-    let runtime = builder.memory().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
+    builder
+        .fiber(RemovalParent)
+        .unwrap()
+        .fiber(Stoppable)
+        .unwrap();
+    builder.start().unwrap();
     let start_group = |group: &[u8]| {
-        let mut changes = Changes::new();
-        changes
-            .mkdir(group)
-            .start::<Stoppable>(group, b"child", &"partial output".into())
-            .unwrap();
-        runtime.commit_blocking(&changes).unwrap();
-        until(&runtime, |snapshot| {
-            snapshot.read(b"stoppable").unwrap().as_deref() == Some(b"waiting")
+        let parent = start::<RemovalParent>(&runtime, group, &());
+        let child = process_path(&parent, b"child");
+        let waiting = until(&runtime, |snapshot| {
+            snapshot
+                .fiber(&child)
+                .unwrap()
+                .is_some_and(|record| record.waits_until.is_some())
         });
+        waiting.fiber(&parent).unwrap().unwrap().id
     };
 
-    start_group(b"graceful");
-    let mut graceful = Changes::new();
-    graceful.remove(b"graceful", Some(Bytes::from_static(b"cleanup")));
+    let parent = start_group(b"graceful");
+    let mut graceful = Changes::new().unwrap();
+    graceful
+        .remove(&parent, Some(Bytes::from_static(b"cleanup")))
+        .unwrap();
     runtime.commit_blocking(&graceful).unwrap();
     let stopped = until(&runtime, |snapshot| {
-        snapshot.stat(b"graceful").unwrap().is_none()
+        snapshot.fiber(parent.path()).unwrap().is_none()
     });
+    assert!(stopped.fibers(parent.path(), b"").unwrap().is_empty());
     assert_eq!(
         stopped.read(b"stoppable").unwrap().as_deref(),
         Some(b"stopped".as_slice())
     );
 
-    start_group(b"forced");
-    let mut forced = Changes::new();
-    forced.force_remove(b"forced", Some(Bytes::from_static(b"discard")));
+    let parent = start_group(b"forced");
+    let mut forced = Changes::new().unwrap();
+    forced
+        .force_remove(&parent, Some(Bytes::from_static(b"discard")))
+        .unwrap();
     runtime.commit_blocking(&forced).unwrap();
     let stopped = until(&runtime, |snapshot| {
-        snapshot.stat(b"forced").unwrap().is_none()
+        snapshot.fiber(parent.path()).unwrap().is_none()
     });
+    assert!(stopped.fibers(parent.path(), b"").unwrap().is_empty());
     assert_eq!(
         stopped.read(b"stoppable").unwrap().as_deref(),
         Some(b"waiting".as_slice())
@@ -612,7 +664,7 @@ impl Fiber for Fails {
         input: String,
         _: Option<()>,
     ) -> anyhow::Result<Ending<(), ()>> {
-        run.changes.write(input.as_bytes(), b"staged");
+        run.changes.write(input.as_bytes(), b"staged")?;
         match input.as_str() {
             "fail" => Ok(Ending::Fail("explicit failure".into())),
             "error" => Err(Error {
@@ -628,9 +680,10 @@ impl Fiber for Fails {
 
 #[test]
 fn explicit_failure_commits_writes_while_errors_and_panics_discard_them() {
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Fails).unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     for (kind, message, file) in [
         (
             "fail",
@@ -679,10 +732,11 @@ impl Drop for Tracked {
 }
 
 #[test]
-fn registration_ownership_covers_rejection_failed_open_and_close() {
+fn registration_ownership_covers_rejection_failed_start_and_close() {
     let releases = Arc::new(AtomicUsize::new(0));
     let count = || releases.load(Ordering::SeqCst);
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Tracked(releases.clone())).unwrap();
     assert_eq!(
         builder.fiber(Tracked(releases.clone())).unwrap_err().code,
@@ -692,16 +746,17 @@ fn registration_ownership_covers_rejection_failed_open_and_close() {
     drop(builder);
     assert_eq!(count(), 2);
 
-    let directory = tempfile::tempdir().unwrap();
-    let _locked = Builder::new().unwrap().open(directory.path()).unwrap();
-    let mut builder = Builder::new().unwrap();
+    let closed = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&closed).unwrap();
     builder.fiber(Tracked(releases.clone())).unwrap();
-    assert!(builder.open(directory.path()).is_err());
+    closed.close().unwrap();
+    assert_eq!(builder.start().unwrap_err().status(), Status::Closed);
     assert_eq!(count(), 3);
 
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Tracked(releases.clone())).unwrap();
-    let runtime = builder.memory().unwrap();
+    builder.start().unwrap();
     assert_eq!(count(), 3);
     runtime.close().unwrap();
     assert_eq!(count(), 4);
@@ -723,8 +778,8 @@ impl Fiber for CallbackOwner {
 
     fn run(&self, _: &mut Run<'_>, _: (), _: Option<()>) -> anyhow::Result<Ending<(), ()>> {
         let runtime = self.runtime.lock().unwrap().take().unwrap();
-        let open = Builder::new().and_then(Builder::memory).unwrap_err().code;
-        let commit = runtime.commit_blocking(&Changes::new()).unwrap_err().code;
+        let open = Runtime::open(None, None).unwrap_err().code;
+        let commit = runtime.commit_blocking(&Changes::new()?).unwrap_err().code;
         let snapshot = runtime.snapshot().unwrap_err().code;
         assert_eq!(runtime.new_id().unwrap_err().code, 6);
         assert_eq!(runtime.now_ms().unwrap_err().code, 6);
@@ -737,7 +792,7 @@ impl Fiber for CallbackOwner {
 
 impl Drop for CallbackOwner {
     fn drop(&mut self) {
-        let code = Builder::new().and_then(Builder::memory).unwrap_err().code;
+        let code = Runtime::open(None, None).unwrap_err().code;
         let _ = self.released.send(code);
         panic_any(PanicOnDrop);
     }
@@ -748,7 +803,8 @@ fn callbacks_reject_blocking_calls_and_can_drop_the_last_runtime_owner() {
     let (report, ran) = mpsc::channel();
     let (released, release) = mpsc::channel();
     let slot = Arc::new(Mutex::new(None));
-    let mut builder = Builder::new().unwrap();
+    let runtime = Runtime::open(None, None).unwrap();
+    let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(CallbackOwner {
             runtime: slot.clone(),
@@ -758,7 +814,8 @@ fn callbacks_reject_blocking_calls_and_can_drop_the_last_runtime_owner() {
         .unwrap();
     {
         let mut guard = slot.lock().unwrap();
-        let runtime = guard.insert(builder.memory().unwrap());
+        let runtime = guard.insert(runtime);
+        builder.start().unwrap();
         start::<CallbackOwner>(runtime, b"reenter", &());
     }
     assert_eq!(ran.recv_timeout(TIMEOUT).unwrap(), (6, 6, 6, 6));
