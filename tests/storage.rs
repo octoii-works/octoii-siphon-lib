@@ -257,10 +257,15 @@ fn metadata_and_index_pages_follow_their_snapshot() {
             .meta(path, &[tag(Some(value))], &[])
             .unwrap();
     }
+    let label_name = b"system.removing";
+    let label_value = b"true";
     changes
         .meta(
             b"team/item:a",
-            &[],
+            &[(
+                Bytes::from_static(label_name),
+                Some(Bytes::from_static(label_value)),
+            )],
             &[(
                 Bytes::from_static(b"note"),
                 Some(Bytes::from_static(b"\x00\xff")),
@@ -286,6 +291,39 @@ fn metadata_and_index_pages_follow_their_snapshot() {
         entry.annotation(b"note").map(Bytes::as_ref),
         Some(b"\x00\xff".as_slice())
     );
+
+    assert_eq!(
+        entry.label(label_name).map(Bytes::as_ref),
+        Some(label_value.as_slice())
+    );
+    let stat = before.stat(b"team/item:a").unwrap().unwrap();
+    assert_eq!(stat, first[0].entry);
+    let listed = before
+        .list(
+            b"team",
+            &Range {
+                prefix: b"item:a",
+                limit: 10,
+                ..Range::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(listed, [stat]);
+
+    let indexed = before
+        .find(
+            &Query {
+                name: label_name,
+                value: Some(label_value),
+                ..query
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].path, first[0].path);
+    assert_eq!(indexed[0].value, Bytes::from_static(label_value));
 
     let rest = before
         .find(
@@ -341,6 +379,10 @@ fn metadata_and_index_pages_follow_their_snapshot() {
         .unwrap();
     assert_eq!(removed.label(b"tag"), None);
     assert_eq!(removed.annotation(b"note"), None);
+    assert_eq!(
+        removed.label(label_name).map(Bytes::as_ref),
+        Some(label_value.as_slice())
+    );
 }
 
 #[test]

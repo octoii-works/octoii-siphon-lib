@@ -121,7 +121,6 @@ pub struct DirectoryView {
     pub annotations: NamedSlice,
     pub created_seq: u64,
     pub changed_seq: u64,
-    pub removing: u8,
 }
 #[repr(C)]
 pub struct EntryView {

@@ -17,7 +17,6 @@ pub struct Directory {
     pub annotations: Vec<(Bytes, Bytes)>,
     pub created_seq: u64,
     pub changed_seq: u64,
-    pub removing: bool,
 }
 
 impl Directory {
@@ -357,7 +356,6 @@ unsafe fn copy_entry(view: &sys::EntryView) -> Entry {
                 annotations: copy_named(&directory.annotations),
                 created_seq: directory.created_seq,
                 changed_seq: directory.changed_seq,
-                removing: directory.removing != 0,
             }),
         }
     }

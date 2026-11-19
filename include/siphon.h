@@ -49,7 +49,6 @@ typedef struct {
     siphon_named_slice annotations;
     uint64_t created_seq;
     uint64_t changed_seq;
-    uint8_t removing;
 } siphon_directory_view;
 typedef struct {
     siphon_slice name;
