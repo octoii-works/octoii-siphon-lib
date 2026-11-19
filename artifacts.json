@@ -1,7 +1,23 @@
 {
   "aarch64-apple-darwin": {
     "abi": 5,
-    "sha256": "10b03b4a8fc53c32d0f61a41a117a289c51b86c43a78d4c3256c8a47fbca744b",
+    "sha256": "47b383535995516cbf059b3fa5466582d3d2e01b15eaf2371937d2954a734538",
     "target": "aarch64-apple-darwin"
+  },
+  "x86_64-apple-darwin": {
+    "abi": 5,
+    "sha256": "bdc631d5b24361f853494bf05cd181aee86113d3cb51e4c937340b81a44ebdbb",
+    "target": "x86_64-apple-darwin"
+  },
+  "x86_64-pc-windows-msvc": {
+    "abi": 5,
+    "dll_sha256": "937ce5257de9e54350b08ec3c36bf276800448c9e4a0c736aec0dde7f6225fb9",
+    "sha256": "0d8a2c550d9b6a61f45aea63044f410fabc4d48fac1d1a70fcae50e4b29add6a",
+    "target": "x86_64-pc-windows-msvc"
+  },
+  "x86_64-unknown-linux-gnu": {
+    "abi": 5,
+    "sha256": "4e81efe732cc15d12de9a7b747d8ab512985c38046d42236a4cc5d1a2a169f54",
+    "target": "x86_64-unknown-linux-gnu"
   }
 }
