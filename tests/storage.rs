@@ -2,12 +2,12 @@ use bytes::Bytes;
 
 use std::time::Duration;
 
-use octoii_siphon_lib::{Changes, FileKind, Namespace, Query, Range, Runtime, Status};
+use octoii_siphon_lib::{Builder, Changes, FileKind, Namespace, Query, Range, Status};
 
 #[test]
 fn snapshots_are_consistent_and_data_survives_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::open(directory.path()).unwrap();
+    let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
     let mut first = Changes::new();
     first.write(b"file", b"one").write(b"empty", b"");
     let seq = runtime.commit_blocking(&first).unwrap();
@@ -30,7 +30,7 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
     );
     drop(before);
     drop(runtime);
-    let reopened = Runtime::open(directory.path()).unwrap();
+    let reopened = Builder::new().unwrap().open(directory.path()).unwrap();
     assert_eq!(
         reopened.snapshot().unwrap().read(b"file").unwrap(),
         Some(Bytes::from_static(b"two"))
@@ -39,7 +39,7 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
 
 #[test]
 fn directory_pages_and_entries_are_owned_after_runtime_close() {
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let mut changes = Changes::new();
     changes
         .mkdir(b"data")
@@ -122,7 +122,7 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
 
 #[test]
 fn metadata_and_index_pages_follow_their_snapshot() {
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let mut changes = Changes::new();
     changes.mkdir(b"team").mkdir(b"team-other");
     let entries: &[(&[u8], &[u8])] = &[
@@ -220,7 +220,7 @@ fn metadata_and_index_pages_follow_their_snapshot() {
 
 #[test]
 fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let initial = runtime.snapshot().unwrap().journal(0, 1).unwrap();
     assert!(initial.change_sets.is_empty());
     assert_eq!(
@@ -284,7 +284,7 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
 #[test]
 fn volume_ids_and_file_retention_survive_reopening() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::open(directory.path()).unwrap();
+    let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
     let first = runtime.new_id().unwrap();
     assert_eq!(first.len(), 36);
     assert_eq!(first.as_bytes()[14], b'7');
@@ -329,7 +329,7 @@ fn volume_ids_and_file_retention_survive_reopening() {
     assert_eq!(runtime.now_ms().unwrap_err().code, 3);
     drop((before, after, runtime));
 
-    let reopened = Runtime::open(directory.path()).unwrap();
+    let reopened = Builder::new().unwrap().open(directory.path()).unwrap();
     assert!(reopened.new_id().unwrap() > first);
     assert_eq!(
         reopened
@@ -349,18 +349,20 @@ fn volume_ids_and_file_retention_survive_reopening() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let mut watch = runtime.committed().unwrap();
     assert_eq!(
-        watch.sequence(),
-        runtime.snapshot().unwrap().sequence().unwrap()
+        tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .unwrap(),
+        Some(runtime.snapshot().unwrap().sequence().unwrap())
     );
 
     let mut rejected = Changes::new();
     rejected.write(b"absent/child", b"no");
     assert!(runtime.commit_blocking(&rejected).is_err());
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), watch.changed())
+        tokio::time::timeout(Duration::from_millis(25), watch.next())
             .await
             .is_err()
     );
@@ -369,21 +371,26 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
     batch.write(b"file", b"one");
     let first = runtime.commit_blocking(&batch).unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
             .unwrap()
             .unwrap(),
         first
     );
 
-    let cancelled = runtime.committed().unwrap();
-    assert_eq!(cancelled.sequence(), first);
+    let mut cancelled = runtime.committed().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), cancelled.next())
+            .await
+            .unwrap(),
+        Some(first)
+    );
     drop(cancelled);
     let mut next = Changes::new();
     next.write(b"file", b"two");
     let second = runtime.commit_blocking(&next).unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
             .unwrap()
             .unwrap(),
@@ -394,16 +401,16 @@ async fn commit_watch_reports_progress_and_closes_with_its_runtime() {
     assert_eq!(journal.change_sets[0].paths, [b"file".to_vec()]);
 
     runtime.close().unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), watch.changed())
+    let closed = tokio::time::timeout(Duration::from_secs(5), watch.next())
         .await
         .unwrap();
-    assert!(closed.is_err());
+    assert_eq!(closed, None);
     assert_eq!(runtime.committed().unwrap_err().code, 3);
 }
 
 #[test]
 fn a_failed_batch_does_not_commit_earlier_writes() {
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let mut batch = Changes::new();
     let tag = |value: &'static [u8]| (Bytes::from_static(b"tag"), Some(Bytes::from_static(value)));
     batch
@@ -439,8 +446,8 @@ fn a_failed_batch_does_not_commit_earlier_writes() {
 async fn failure_cleanup_and_drop_work_inside_an_async_host() {
     let directory = tempfile::tempdir().unwrap();
     for _ in 0..10 {
-        let runtime = Runtime::open(directory.path()).unwrap();
-        let error = Runtime::open(directory.path()).unwrap_err();
+        let runtime = Builder::new().unwrap().open(directory.path()).unwrap();
+        let error = Builder::new().unwrap().open(directory.path()).unwrap_err();
         assert_ne!(error.code, 5, "locked directory must not panic");
         drop(runtime);
     }
@@ -474,7 +481,7 @@ fn a_namespace_mounts_host_and_read_only_volume_views() {
     assert_eq!(names.len(), 1);
     assert_eq!(names[0].name.as_ref(), b"one");
 
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let mut changes = Changes::new();
     changes
         .mkdir(b"document:first")

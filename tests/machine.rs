@@ -2,13 +2,13 @@
 
 use std::time::Duration;
 
-use octoii_siphon_lib::{CommandEvent, Exec, Exit, Namespace, Runtime, Spec, Status, Stdio};
+use octoii_siphon_lib::{Builder, CommandEvent, Exec, Exit, Namespace, Spec, Status, Stdio};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_use_the_runtime_namespace_and_keep_ordered_io() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().to_str().unwrap();
-    let runtime = Runtime::memory().unwrap();
+    let runtime = Builder::new().unwrap().memory().unwrap();
     let namespace = Namespace::new().unwrap();
     namespace.mount_host("", "/", true).unwrap();
     let mut spec = Spec::new(Exec::Shell("cat; printf retained >&2".into()), workspace);

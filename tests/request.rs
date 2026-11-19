@@ -39,8 +39,8 @@ fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Bytes {
 fn finish<P: Fiber>(runtime: &Runtime, process: &[u8]) -> Outcome<P::Output> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let outcome = runtime.snapshot().unwrap().outcome::<P>(process).unwrap();
-        if let Some(outcome) = outcome {
+        let record = runtime.snapshot().unwrap().fiber(process).unwrap().unwrap();
+        if let Some(outcome) = record.decode_outcome::<P>().unwrap() {
             return outcome;
         }
         assert!(
@@ -627,7 +627,7 @@ fn tracked(
 #[test]
 fn request_registrations_are_released_on_rejection_and_failed_open() {
     let directory = tempfile::tempdir().unwrap();
-    let _locked = Runtime::open(directory.path()).unwrap();
+    let _locked = Builder::new().unwrap().open(directory.path()).unwrap();
     let executor = host();
     let (released, dropped) = mpsc::channel();
     let mut builder = Builder::new().unwrap();

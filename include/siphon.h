@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 4 is experimental until a release. All handles are opaque.
+/* ABI 5. All handles are opaque.
  * Slices are borrowed for a call. Returned buffers must be freed by this library.
  * Never free or mutate handles concurrently with their use.
  * Runtime calls serialize internally. Snapshot reads are thread-safe.
@@ -281,7 +281,6 @@ void siphon_commit_watch_free(siphon_commit_watch *watch);
 siphon_status siphon_changes_new(siphon_changes **out);
 uint8_t siphon_changes_is_empty(const siphon_changes *changes);
 siphon_status siphon_changes_extend(siphon_changes *changes, siphon_changes *other);
-siphon_status siphon_changes_rename(siphon_changes *changes, siphon_slice from, siphon_slice to);
 siphon_status siphon_changes_limit(siphon_changes *changes, siphon_slice process, siphon_slice counter, uint64_t maximum);
 void siphon_changes_free(siphon_changes *changes);
 siphon_status siphon_changes_mkdir(siphon_changes *changes, siphon_slice path);
@@ -380,7 +379,6 @@ siphon_status siphon_snapshot_fiber(const siphon_snapshot *snapshot, siphon_slic
     siphon_fiber_visitor visit);
 siphon_status siphon_snapshot_fibers(const siphon_snapshot *snapshot, siphon_slice parent, siphon_slice kind,
     void *context, siphon_fiber_path_visitor visit);
-siphon_status siphon_snapshot_has_requests(const siphon_snapshot *snapshot, siphon_slice under, uint8_t *out);
 void siphon_snapshot_free(siphon_snapshot *snapshot);
 #ifdef __cplusplus
 }

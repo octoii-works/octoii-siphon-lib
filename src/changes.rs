@@ -160,18 +160,6 @@ impl Batch<'_> {
         self.stage(status)
     }
 
-    pub fn rename(&mut self, from: impl AsRef<[u8]>, to: impl AsRef<[u8]>) -> &mut Self {
-        // SAFETY: the batch is exclusive and slices live for the call.
-        let status = unsafe {
-            sys::siphon_changes_rename(
-                self.raw.0.as_ptr(),
-                slice(from.as_ref()),
-                slice(to.as_ref()),
-            )
-        };
-        self.stage(check(status))
-    }
-
     pub fn meta(
         &mut self,
         path: impl AsRef<[u8]>,

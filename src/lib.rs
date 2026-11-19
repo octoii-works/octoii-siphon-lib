@@ -19,7 +19,6 @@ use std::{
     mem::{ManuallyDrop, forget},
     ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::Path,
     ptr::NonNull,
     sync::Arc,
 };
@@ -185,7 +184,7 @@ fn decode_id(status: sys::Status, buffer: sys::Buffer) -> Result<String> {
 }
 fn compatible() -> Result<()> {
     // SAFETY: this function has no arguments or preconditions.
-    if unsafe { sys::siphon_abi_version() } == 4 {
+    if unsafe { sys::siphon_abi_version() } == 5 {
         Ok(())
     } else {
         Err(Error {
@@ -221,13 +220,6 @@ struct Owner {
 }
 
 impl Runtime {
-    pub fn open(directory: &Path) -> Result<Self> {
-        Builder::new()?.open(directory)
-    }
-    pub fn memory() -> Result<Self> {
-        Builder::new()?.memory()
-    }
-
     fn from_open(ptr: *mut sys::Runtime) -> Result<Self> {
         Ok(Self(Arc::new(Owner {
             handle: ManuallyDrop::new(RuntimeHandle(handle(ptr)?)),
@@ -330,7 +322,7 @@ impl RuntimeHandle {
 
     /// Watches the latest committed sequence. Read the snapshot journal for change details.
     pub fn committed(&self) -> Result<CommitWatch> {
-        let (sender, mut receiver) = watch::channel(0);
+        let (sender, receiver) = watch::channel(0);
         let context = Box::into_raw(Box::new(sender)).cast();
         let mut out = std::ptr::null_mut();
         // SAFETY: the runtime and output are live. The native call takes ownership of context.
@@ -344,7 +336,6 @@ impl RuntimeHandle {
             )
         })?;
         let handle = handle(out)?;
-        receiver.mark_unchanged();
         Ok(CommitWatch { handle, receiver })
     }
 }
@@ -360,15 +351,11 @@ pub struct CommitWatch {
 unsafe impl Send for CommitWatch {}
 
 impl CommitWatch {
-    /// The latest sequence delivered to this watch.
-    pub fn sequence(&self) -> u64 {
-        *self.receiver.borrow()
-    }
-
-    /// Waits for progress and returns the latest sequence. Closing the runtime ends the watch.
-    pub async fn changed(&mut self) -> std::result::Result<u64, watch::error::RecvError> {
-        self.receiver.changed().await?;
-        Ok(*self.receiver.borrow_and_update())
+    /// Returns the current sequence on the first call, then waits for a later sequence.
+    /// When the runtime closes, returns any unseen sequence before returning `None`.
+    pub async fn next(&mut self) -> Option<u64> {
+        self.receiver.changed().await.ok()?;
+        Some(*self.receiver.borrow_and_update())
     }
 }
 

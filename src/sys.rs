@@ -433,7 +433,6 @@ unsafe extern "C" {
     pub fn siphon_changes_new(out: *mut *mut Changes) -> Status;
     pub fn siphon_changes_is_empty(changes: *const Changes) -> u8;
     pub fn siphon_changes_extend(changes: *mut Changes, other: *mut Changes) -> Status;
-    pub fn siphon_changes_rename(changes: *mut Changes, from: Slice, to: Slice) -> Status;
     pub fn siphon_changes_limit(
         changes: *mut Changes,
         process: Slice,
@@ -534,11 +533,6 @@ unsafe extern "C" {
         kind: Slice,
         context: *mut c_void,
         visit: Option<unsafe extern "C" fn(*mut c_void, Slice)>,
-    ) -> Status;
-    pub fn siphon_snapshot_has_requests(
-        snapshot: *const Snapshot,
-        under: Slice,
-        out: *mut u8,
     ) -> Status;
     pub fn siphon_snapshot_free(snapshot: *mut Snapshot);
     pub fn siphon_run_info(

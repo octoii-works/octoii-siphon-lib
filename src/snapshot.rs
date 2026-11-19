@@ -110,6 +110,33 @@ pub struct FiberRecord {
     pub outcome: Option<Outcome>,
 }
 
+impl FiberRecord {
+    /// Decodes a recorded outcome using the Fiber's output type. The kind and version must match.
+    pub fn decode_outcome<P: Fiber>(&self) -> Result<Option<Outcome<P::Output>>> {
+        if self.kind != P::KIND.as_bytes() || self.version != P::VERSION {
+            return Err(Error {
+                code: 2,
+                message: "the Fiber record has a different kind or version".into(),
+            });
+        }
+        let Some(outcome) = &self.outcome else {
+            return Ok(None);
+        };
+        let outcome = match outcome {
+            Outcome::Completed(result) => Outcome::Completed(decode(result.as_deref())?),
+            Outcome::Failed { error, reason } => Outcome::Failed {
+                error: error.clone(),
+                reason: reason.clone(),
+            },
+            Outcome::Stopped { result, reason } => Outcome::Stopped {
+                result: decode(result.as_deref())?,
+                reason: reason.clone(),
+            },
+        };
+        Ok(Some(outcome))
+    }
+}
+
 /// A view of one committed revision. It may be retained or borrowed from a Fiber phase.
 #[repr(transparent)]
 #[derive(Debug)]
@@ -152,16 +179,6 @@ impl Snapshot {
 
     pub fn read(&self, path: &[u8]) -> Result<Option<Bytes>> {
         self.read_range(path, 0, u64::MAX)
-    }
-
-    /// Whether this snapshot has an unanswered request below a volume path.
-    pub fn has_pending_requests(&self, under: &[u8]) -> Result<bool> {
-        let mut found = 0;
-        // SAFETY: snapshot and path are live and found is writable.
-        check(unsafe {
-            sys::siphon_snapshot_has_requests(self.as_ptr(), slice(under), &mut found)
-        })?;
-        Ok(found != 0)
     }
 
     /// Lists direct child Fibers of the stated kind. An empty kind lists every child Fiber.
@@ -296,30 +313,6 @@ impl Snapshot {
                 message: "Siphon returned no record for a successful Fiber read".into(),
             })?
             .map(Some)
-    }
-
-    pub fn outcome<P: Fiber>(&self, process: &[u8]) -> Result<Option<Outcome<P::Output>>> {
-        let Some(record) = self.fiber(process)? else {
-            return Ok(None);
-        };
-        if record.kind != P::KIND.as_bytes() || record.version != P::VERSION {
-            return Err(Error {
-                code: 2,
-                message: "the Fiber at this path has a different kind or version".into(),
-            });
-        }
-        let Some(outcome) = record.outcome else {
-            return Ok(None);
-        };
-        let outcome = match outcome {
-            Outcome::Completed(result) => Outcome::Completed(decode(result.as_deref())?),
-            Outcome::Failed { error, reason } => Outcome::Failed { error, reason },
-            Outcome::Stopped { result, reason } => Outcome::Stopped {
-                result: decode(result.as_deref())?,
-                reason,
-            },
-        };
-        Ok(Some(outcome))
     }
 }
 
