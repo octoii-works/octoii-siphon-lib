@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::spawn_with;
 use crate::{
-    Builder, Command, CommandEvents, FiberId, Namespace, Result, RuntimeHandle, Spec, borrow_slice,
-    check, discard_panic, panic_message, release_context, slice, sys,
+    Builder, Command, CommandEvents, FiberId, Namespace, Result, Spec, borrow_slice, check,
+    discard_panic, panic_message, release_context, slice, sys,
 };
 
 /// A request name, its typed payload, and the value returned by its handler.
@@ -78,14 +78,30 @@ impl RequestId {
     }
 }
 
+/// Observes a request's cooperative stop signal.
+#[derive(Debug, Clone)]
+pub struct Stop(CancellationToken);
+
+impl Stop {
+    /// Returns whether the runtime has requested a stop.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Waits for the runtime to request a stop.
+    pub async fn requested(&self) {
+        self.0.cancelled().await;
+    }
+}
+
 /// A delivered request passed to its host handler.
 #[derive(Debug)]
 pub struct Asked<R> {
     pub id: RequestId,
     pub payload: R,
-    pub runtime: RuntimeHandle,
     /// Signals a stop. The handler can return a partial answer or [`Unanswered::Interrupted`].
-    pub cancelled: CancellationToken,
+    pub stop: Stop,
     delivery: Arc<Reply>,
 }
 
@@ -155,7 +171,7 @@ impl Builder {
     /// Registers a request handler on a host Tokio executor.
     ///
     /// The executor must run while requests are handled. Delivery can begin during
-    /// [`Builder::start`]. A process stop signals [`Asked::cancelled`] so the handler can
+    /// [`Builder::start`]. A process stop signals [`Asked::stop`] so the handler can
     /// cooperate. Closing a delivery asks the executor to abort its task and lets Siphon
     /// shut down without waiting for the host.
     pub fn handle<R, F, A>(&mut self, executor: &Handle, handler: F) -> Result<&mut Self>
@@ -190,7 +206,7 @@ struct Registration<F> {
 }
 
 struct Delivery {
-    cancelled: CancellationToken,
+    stop: CancellationToken,
     task: AbortHandle,
 }
 
@@ -238,25 +254,19 @@ where
         // SAFETY: native keeps its registration and slices live throughout the callback.
         let registration = unsafe { &*context.cast::<Registration<F>>() };
         let (id, payload) = unsafe { (RequestId::from_view(&*id), borrow_slice(payload).to_vec()) };
-        let cancelled = CancellationToken::new();
-        let signal = cancelled.clone();
+        let stopped = CancellationToken::new();
+        let stop = Stop(stopped.clone());
         let handler = Arc::clone(&registration.handler);
         let delivery = Arc::clone(&reply);
-        let mut retained = std::ptr::null();
-        // SAFETY: the reply is live and retained is writable.
-        let runtime = check(unsafe { sys::siphon_reply_runtime(reply.0, &mut retained) })
-            .and_then(|()| RuntimeHandle::from_retained(retained));
         let task = registration.executor.spawn(async move {
             let answer = AssertUnwindSafe(async move {
                 let payload = serde_json::from_slice(&payload).map_err(|error| {
                     Unanswered::Failed(format!("the request could not be read: {error}"))
                 })?;
-                let runtime = runtime.map_err(|error| Unanswered::Failed(error.to_string()))?;
                 let given = handler(Asked {
                     id,
                     payload,
-                    runtime,
-                    cancelled: signal,
+                    stop,
                     delivery,
                 })
                 .await?;
@@ -274,7 +284,7 @@ where
             reply.submit(answer);
         });
         let delivery = Delivery {
-            cancelled,
+            stop: stopped,
             task: task.abort_handle(),
         };
         sys::Watch {
@@ -293,7 +303,7 @@ unsafe extern "C" fn notify(context: *mut c_void, event: u32) {
     // SAFETY: native keeps the delivery context live until its notifications finish.
     let delivery = unsafe { &*context.cast::<Delivery>() };
     if let Err(panic) = catch_unwind(AssertUnwindSafe(|| match event {
-        sys::REQUEST_STOP => delivery.cancelled.cancel(),
+        sys::REQUEST_STOP => delivery.stop.cancel(),
         sys::REQUEST_CLOSED => delivery.task.abort(),
         _ => {}
     })) {

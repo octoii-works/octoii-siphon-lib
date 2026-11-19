@@ -30,7 +30,7 @@ pub use command::{Chunk, Command, CommandEvent, CommandEvents, Exec, Exit, Scree
 pub use fiber::{Builder, Ending, Fiber, Options, Outcome, Retries, Run, Wait};
 pub use namespace::{Dirent, FileKind, Namespace, Stat, machine_confines};
 pub use person::{AskedOfPerson, PersonRequest};
-pub use request::{Answer, Asked, Request, RequestCommands, RequestId, Unanswered};
+pub use request::{Answer, Asked, Request, RequestCommands, RequestId, Stop, Unanswered};
 pub use snapshot::{
     ChangeSet, Directory, Entry, FiberRecord, Found, Journal, OwnedSnapshot, Query, Range, Snapshot,
 };
@@ -327,10 +327,6 @@ impl Drop for RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    fn from_retained(out: *const sys::Runtime) -> Result<Self> {
-        Ok(Self(handle(out.cast_mut())?))
-    }
-
     /// Commits a batch without blocking the caller's asynchronous executor.
     pub async fn commit(&self, changes: Changes) -> Result<Revision> {
         let runtime = self.clone();

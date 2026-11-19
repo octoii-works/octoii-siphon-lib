@@ -42,10 +42,12 @@ Open the volume, create a `Builder` bound to that opening, register Fibers and r
 call `Builder::start`. A phase receives its input, checkpoint, snapshot and batch. Siphon commits
 the phase's changes and ending together. A returned error or caught panic follows the native retry policy.
 
-A delivery carries its exact identity, retained runtime access, and a cancellation token. A configured
-local machine lets a handler start commands through the delivery's request capability. Command input
-reports `WouldBlock` when its queue is full. Pipe and terminal output can report a skipped byte range
-that callers can reconcile against the retained output.
+A delivery carries its exact identity and a read-only stop signal. Handlers can check
+`asked.stop.is_requested()` or wait with `asked.stop.requested().await`. Capture a handle from
+`Runtime::runtime_handle` when registering a handler that needs volume state. A configured local machine
+lets a handler start commands through the delivery's request capability. Command input reports
+`WouldBlock` when its queue is full. Pipe and terminal output can report a skipped byte range that
+callers can reconcile against the retained output.
 
 `Run::mail` reads a delivery. `Run::take_mail` stages its consumption once and returns the staged
 delivery. Carry a `RequestId` as an opaque string using `to_token` and `from_token`.

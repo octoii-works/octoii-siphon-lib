@@ -281,8 +281,11 @@ fn stop_signals_the_handler_and_the_stop_phase_reads_its_partial_answer() {
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             let started = started.clone();
             async move {
+                assert!(!asked.stop.is_requested());
+                let stop = asked.stop.clone();
                 started.send(asked.id).unwrap();
-                asked.cancelled.cancelled().await;
+                stop.requested().await;
+                assert!(asked.stop.is_requested());
                 Ok(asked.payload.0)
             }
         })
@@ -543,6 +546,7 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
             .unwrap()
             .is_none()
     );
+    let handler_runtime = prepared.clone();
     let mut builder = Builder::new(&runtime).unwrap();
     builder
         .fiber(Once)
@@ -551,18 +555,18 @@ fn close_leaves_host_work_to_its_executor_and_reopen_interrupts_the_request() {
             let blocked = blocked.lock().unwrap().take().unwrap();
             let dropped = Dropped(dropped.clone());
             let started = started.clone();
+            let runtime = handler_runtime.clone();
             async move {
                 let _dropped = dropped;
                 assert!(
-                    asked
-                        .runtime
+                    runtime
                         .snapshot()
                         .unwrap()
                         .fiber(asked.id.path())
                         .unwrap()
                         .is_some()
                 );
-                started.send(asked.runtime.clone()).unwrap();
+                started.send(runtime).unwrap();
                 // A poll already on the host executor can outlive native shutdown.
                 blocked.recv().unwrap();
                 pending().await

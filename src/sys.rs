@@ -621,7 +621,6 @@ unsafe extern "C" {
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
-    pub fn siphon_reply_runtime(reply: *const Reply, out: *mut *const Runtime) -> Status;
     pub fn siphon_reply_spawn(
         reply: *const Reply,
         namespace: *const Namespace,

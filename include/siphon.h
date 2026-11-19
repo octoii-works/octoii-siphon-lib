@@ -207,9 +207,10 @@ siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, u
  * thread-safe for concurrent deliveries. The identity and its byte slices and the payload are valid
  * only during delivery. Copy any data needed by host work and transfer reply to it.
  * Each call owns reply, even if it declines to handle the request. It may return an empty watch.
- * The watch transfers its context to Siphon if release is supplied. Stop allows an answer; Closed
- * means no more answers are accepted, not that an earlier answer committed. Siphon then releases
- * the watch. All delivery, notification and release callbacks return promptly and do not unwind.
+ * The watch transfers its context to Siphon if release is supplied. Stop asks the host to wind
+ * down and still allows an answer. Closed ends the delivery. A submitted answer may still be
+ * pending commit. Siphon releases the watch after Closed. All delivery, notification and release
+ * callbacks return promptly and do not unwind.
  */
 siphon_status siphon_builder_handle_request(siphon_builder *builder, siphon_slice name, void *context,
     siphon_request_deliver deliver, siphon_release_callback release);
@@ -226,7 +227,7 @@ siphon_status siphon_builder_start(siphon_builder *builder);
  */
 siphon_status siphon_runtime_close(const siphon_runtime *runtime);
 /* Free closes the runtime and consumes the reference obtained from open. Retained references
- * may outlive the owner's free call. Release retained and reply references with siphon_runtime_release.
+ * may outlive the owner's free call. Pair each siphon_runtime_retain with siphon_runtime_release.
  */
 siphon_status siphon_runtime_free(const siphon_runtime *runtime);
 void siphon_runtime_retain(const siphon_runtime *runtime);
@@ -373,8 +374,6 @@ siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key, void *cont
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
  */
 siphon_status siphon_reply_submit(const siphon_reply *reply, uint32_t kind, siphon_slice payload);
-/* Retains the delivery's runtime. Release it with siphon_runtime_release. */
-siphon_status siphon_reply_runtime(const siphon_reply *reply, const siphon_runtime **out);
 /* Starts a command owned by this reply's exact request. Uses the same namespace and JSON spec
  * as siphon_runtime_spawn and requires siphon_builder_local_machine. A closed or interrupted
  * request refuses new commands. Call from host work outside a Siphon callback.
