@@ -13,7 +13,7 @@ use std::{
 
 use octoii_siphon_lib::{
     Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome, Query, Range, Run, Runtime,
-    Signal, Snapshot, Status, Wait, process_path,
+    Signal, Snapshot, Status, Wait, fiber_path,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,7 +43,7 @@ fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> Bytes {
     let mut changes = Changes::new().unwrap();
     changes.start::<P>(None, key, input).unwrap();
     runtime.commit_blocking(&changes).unwrap();
-    process_path(b"", key)
+    fiber_path(b"", key)
 }
 
 struct Parent;
@@ -61,7 +61,7 @@ impl Fiber for Parent {
         (label, start): Self::Input,
         checkpoint: Option<u32>,
     ) -> anyhow::Result<Ending<u32, Self::Output>> {
-        assert_eq!(run.id().path(), process_path(b"", b"parent"));
+        assert_eq!(run.id().path(), fiber_path(b"", b"parent"));
         assert!(run.time_ms() > 0 && run.snapshot().sequence()? > 0);
         assert!(!run.is_stop_handler());
         let record = run.snapshot().fiber(run.id().path())?.unwrap();
@@ -133,7 +133,7 @@ impl Fiber for Parent {
                 Ok(Ending::Wait(value + 1, Wait::new().child(b"child")))
             }
             Some(value) if value == start + 2 => {
-                let child = process_path(run.id().path(), b"child");
+                let child = fiber_path(run.id().path(), b"child");
                 assert_eq!(
                     run.snapshot()
                         .fiber(&child)?
@@ -176,7 +176,7 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     let mut builder = Builder::new(&runtime).unwrap();
     builder.fiber(Parent).unwrap().fiber(Child).unwrap();
     builder.start().unwrap();
-    let path = process_path(b"", b"parent");
+    let path = fiber_path(b"", b"parent");
     assert_eq!(runtime.snapshot().unwrap().fiber(&path).unwrap(), None);
     assert_eq!(
         start::<Parent>(&runtime, b"parent", &("answer".into(), 42)),
@@ -601,7 +601,7 @@ fn graceful_removal_runs_stop_handlers_and_force_removal_kills_the_subtree() {
     builder.start().unwrap();
     let start_group = |group: &[u8]| {
         let parent = start::<RemovalParent>(&runtime, group, &());
-        let child = process_path(&parent, b"child");
+        let child = fiber_path(&parent, b"child");
         let waiting = until(&runtime, |snapshot| {
             snapshot
                 .fiber(&child)

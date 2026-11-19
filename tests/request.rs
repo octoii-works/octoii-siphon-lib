@@ -15,7 +15,7 @@ use std::{
 use octoii_siphon_lib::{
     Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, FiberId, Following, Mail,
     Options, Outcome, PersonRequest, Published, Request, RequestId, Run, Runtime, Signal, Status,
-    StreamEvent, Unanswered, Wait, process_path,
+    StreamEvent, Unanswered, Wait, fiber_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +36,7 @@ fn start<P: Fiber>(runtime: &Runtime, key: &[u8], input: &P::Input) -> FiberId {
     runtime
         .snapshot()
         .unwrap()
-        .fiber(&process_path(b"", key))
+        .fiber(&fiber_path(b"", key))
         .unwrap()
         .unwrap()
         .id
@@ -368,7 +368,7 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
             .as_slice(),
         std::slice::from_ref(&original),
     );
-    let unrelated = process_path(b"", b"unrelated");
+    let unrelated = fiber_path(b"", b"unrelated");
     assert!(
         runtime
             .person_requests(&standing, &unrelated)

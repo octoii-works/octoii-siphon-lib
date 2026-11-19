@@ -234,11 +234,11 @@ impl FiberId {
     }
 }
 
-/// The address of the process keyed by `key` under `parent`. An empty parent denotes the root.
-pub fn process_path(parent: &[u8], key: &[u8]) -> bytes::Bytes {
+/// The address of the Fiber keyed by `key` under `parent`. An empty parent denotes the root.
+pub fn fiber_path(parent: &[u8], key: &[u8]) -> bytes::Bytes {
     let mut out = sys::Buffer::default();
     // SAFETY: slices are readable for the call and out is writable.
-    let status = unsafe { sys::siphon_process_path(slice(parent), slice(key), &mut out) };
+    let status = unsafe { sys::siphon_fiber_path(slice(parent), slice(key), &mut out) };
     let path = take(out);
     check(status).expect("readable slices produce a fiber path");
     path.into()

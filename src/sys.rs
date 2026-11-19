@@ -537,7 +537,7 @@ unsafe extern "C" {
         counters: *const CounterView,
         len: usize,
     ) -> Status;
-    pub fn siphon_process_path(parent: Slice, key: Slice, out: *mut Buffer) -> Status;
+    pub fn siphon_fiber_path(parent: Slice, key: Slice, out: *mut Buffer) -> Status;
     pub fn siphon_snapshot_stat(
         snapshot: *const Snapshot,
         path: Slice,

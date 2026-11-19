@@ -330,7 +330,8 @@ siphon_status siphon_changes_seal(siphon_changes *changes, siphon_slice path);
 /* Deadline is in milliseconds since the Unix epoch. Null clears expiration. */
 siphon_status siphon_changes_expire(siphon_changes *changes, siphon_slice path, const int64_t *deadline);
 siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
-siphon_status siphon_process_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
+/* An empty parent selects the execution root. Free the path with siphon_buffer_free. */
+siphon_status siphon_fiber_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
 /* A null parent starts a root Fiber. A child start resolves the supplied parent identity. */
 siphon_status siphon_changes_start(siphon_changes *changes, const siphon_fiber_id *parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
