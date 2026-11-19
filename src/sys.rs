@@ -51,6 +51,10 @@ pub struct Reply {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct RequestCommands {
+    _private: [u8; 0],
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Slice {
     pub data: *const u8,
@@ -620,12 +624,14 @@ unsafe extern "C" {
     pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
-    pub fn siphon_reply_spawn(
-        reply: *const Reply,
+    pub fn siphon_reply_commands(reply: *const Reply, out: *mut *mut RequestCommands) -> Status;
+    pub fn siphon_reply_free(reply: *mut Reply);
+    pub fn siphon_request_commands_spawn(
+        commands: *const RequestCommands,
         namespace: *const Namespace,
         spec: Slice,
         command: *mut *mut Command,
         events: *mut *mut CommandEvents,
     ) -> Status;
-    pub fn siphon_reply_free(reply: *mut Reply);
+    pub fn siphon_request_commands_free(commands: *mut RequestCommands);
 }

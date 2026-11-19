@@ -20,6 +20,7 @@ typedef struct siphon_changes siphon_changes;
 typedef struct siphon_builder siphon_builder;
 typedef struct siphon_run siphon_run;
 typedef struct siphon_reply siphon_reply;
+typedef struct siphon_request_commands siphon_request_commands;
 typedef struct siphon_commit_watch siphon_commit_watch;
 typedef struct siphon_following siphon_following;
 typedef struct siphon_namespace siphon_namespace;
@@ -197,8 +198,8 @@ void siphon_builder_free(siphon_builder *builder);
 /* With non-null release, ownership of context transfers on every call, even on error.
  * Context must support concurrent phase invocations. Release runs after all invocations, or on
  * registration/startup failure. Phase and release callbacks must not unwind or wait for runtime calls.
- * Input and checkpoints are JSON; an empty checkpoint means none. Borrowed phase values are local
- * to the callback thread and valid only until the callback returns.
+ * The callback receives input bytes and an optional JSON checkpoint. An empty checkpoint means
+ * none. Borrowed phase values are local to the callback thread and valid until it returns.
  */
 siphon_status siphon_builder_fiber(siphon_builder *builder, siphon_slice kind, uint32_t version, uint8_t stop_handler,
     uint32_t retries, int64_t delay_min_ms, int64_t delay_max_ms, void *context, siphon_phase_callback run, siphon_release_callback release);
@@ -332,7 +333,9 @@ siphon_status siphon_changes_expire(siphon_changes *changes, siphon_slice path, 
 siphon_status siphon_changes_delete(siphon_changes *changes, siphon_slice path);
 /* An empty parent selects the execution root. Free the path with siphon_buffer_free. */
 siphon_status siphon_fiber_path(siphon_slice parent, siphon_slice key, siphon_buffer *out);
-/* A null parent starts a root Fiber. A child start resolves the supplied parent identity. */
+/* A null parent starts a root Fiber. A child start resolves the supplied parent identity.
+ * The kind must be nonempty and the version positive. The batch copies the input bytes.
+ */
 siphon_status siphon_changes_start(siphon_changes *changes, const siphon_fiber_id *parent, siphon_slice key, siphon_slice kind,
     uint32_t version, siphon_slice input);
 /* Execution changes copy the Fiber identity and any other byte fields. They resolve
@@ -357,11 +360,10 @@ siphon_changes *siphon_run_changes(siphon_run *run);
 const siphon_snapshot *siphon_run_snapshot(const siphon_run *run);
 siphon_status siphon_run_wait_for(siphon_run *run, uint32_t kind, siphon_slice value);
 siphon_status siphon_run_wait_until(siphon_run *run, int64_t deadline);
-/* Stage a request and return its unique key. A missing answer returns status 1.
- * The outputs belong to the library; free them with siphon_buffer_free.
- */
+/* Stages a request with a nonempty UTF-8 key and name. The payload is JSON. */
 siphon_status siphon_run_request(siphon_run *run, siphon_slice key, siphon_slice name, siphon_slice payload);
 siphon_status siphon_run_cancel_request(siphon_run *run, siphon_slice key);
+/* A missing answer returns status 1. Free the returned payload with siphon_buffer_free. */
 siphon_status siphon_run_answer(const siphon_run *run, siphon_slice key, uint32_t *kind, siphon_buffer *payload);
 /* A synchronous visitor borrows the phase's mail. An absent entry returns status 1.
  * The visitor must not unwind or mutate the phase. Mail keys, names and payloads are bytes.
@@ -374,12 +376,18 @@ siphon_status siphon_run_take_mail(siphon_run *run, siphon_slice key, void *cont
  * Status 3 means this reply is closed. Free exactly once; pending free abandons the delivery.
  */
 siphon_status siphon_reply_submit(const siphon_reply *reply, uint32_t kind, siphon_slice payload);
-/* Starts a command owned by this reply's exact request. Uses the same namespace and JSON spec
- * as siphon_runtime_spawn and requires siphon_builder_local_machine. A closed or interrupted
- * request refuses new commands. Call from host work outside a Siphon callback.
+/* Copies the reply's command capability into an owned handle, even during delivery.
+ * The handle can outlive the reply and runtime. Release it with siphon_request_commands_free.
  */
-siphon_status siphon_reply_spawn(const siphon_reply *reply, const siphon_namespace *namespace_,
+siphon_status siphon_reply_commands(const siphon_reply *reply, siphon_request_commands **out);
+/* Starts a command owned by the exact request. Uses the same namespace, JSON spec, and output
+ * ownership as siphon_runtime_spawn and requires siphon_builder_local_machine. A closed or
+ * interrupted request refuses new commands. Returns SIPHON_CLOSED when the runtime has closed.
+ * Call from host work outside a Siphon callback.
+ */
+siphon_status siphon_request_commands_spawn(const siphon_request_commands *commands, const siphon_namespace *namespace_,
     siphon_slice spec, siphon_command **command, siphon_command_events **events);
+void siphon_request_commands_free(siphon_request_commands *commands);
 /* Publishes bytes on a UTF-8 topic for this reply's request. Status 3 means delivery is closed. */
 siphon_status siphon_reply_publish(const siphon_reply *reply, siphon_slice topic, siphon_slice data);
 void siphon_reply_free(siphon_reply *reply);

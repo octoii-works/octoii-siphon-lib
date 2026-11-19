@@ -711,9 +711,9 @@ mod machine_requests {
     use tokio::time::timeout;
 
     use super::{
-        Answer, Arc, Asked, Builder, Bytes, Changes, Deserialize, Ending, Fiber, Mail, Outcome,
-        Request, RequestId, Run, Runtime, Serialize, Status, TIMEOUT, Unanswered, Wait, finish,
-        start,
+        Answer, Arc, Asked, Builder, Bytes, Changes, Deserialize, Ending, Fiber, Lookup, Mail,
+        Once, Outcome, Request, RequestId, Response, Run, Runtime, Serialize, Status, TIMEOUT,
+        Unanswered, Wait, finish, host, pending, start,
     };
 
     const PAGE_KEYS: [&str; 2] = ["cover", "body"];
@@ -796,7 +796,7 @@ mod machine_requests {
         namespace: Arc<Namespace>,
         started: mpsc::UnboundedSender<Rendering>,
     ) -> anyhow::Result<String> {
-        let commands = asked.commands();
+        let commands = asked.commands()?;
         let (command, mut events) = commands.spawn(&namespace, &renderer(asked.payload.0))?;
         let (exited, exit) = oneshot::channel();
         let rendering = Rendering {
@@ -833,6 +833,43 @@ mod machine_requests {
 
     async fn next_render(started: &mut mpsc::UnboundedReceiver<Rendering>) -> Rendering {
         timeout(TIMEOUT, started.recv()).await.unwrap().unwrap()
+    }
+
+    #[test]
+    fn retained_commands_do_not_keep_an_abandoned_reply_open() {
+        let executor = host();
+        let (started, retained) = std::sync::mpsc::channel();
+        let runtime = Runtime::open(None, None).unwrap();
+        let mut builder = Builder::new(&runtime).unwrap();
+        builder
+            .local_machine()
+            .unwrap()
+            .fiber(Once)
+            .unwrap()
+            .handle::<Lookup, _, _>(executor.handle(), move |asked| {
+                let started = started.clone();
+                async move {
+                    started.send(asked.commands().unwrap()).unwrap();
+                    pending().await
+                }
+            })
+            .unwrap();
+        builder.start().unwrap();
+        let process = start::<Once>(&runtime, b"abandoned", &42);
+        let commands = retained.recv_timeout(TIMEOUT).unwrap();
+
+        drop(executor);
+        assert_eq!(
+            finish::<Once>(&runtime, &process),
+            Outcome::Completed(Some(Response::Interrupted))
+        );
+        let namespace = Namespace::new().unwrap();
+        namespace.mount_host("", "/", true).unwrap();
+        let error = commands
+            .spawn(&namespace, &renderer("Abandoned".into()))
+            .unwrap_err();
+        assert_eq!(error.status(), Status::Refused);
+        runtime.close().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

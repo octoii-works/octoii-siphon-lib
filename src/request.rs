@@ -3,6 +3,7 @@ use std::{
     fmt,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
+    ptr::{self, NonNull},
     sync::Arc,
 };
 
@@ -14,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::command::spawn_with;
 use crate::{
     Builder, Command, CommandEvents, FiberId, Namespace, Result, Spec, borrow_slice, check,
-    discard_panic, panic_message, release_context, slice, sys,
+    discard_panic, handle, panic_message, release_context, slice, sys,
 };
 
 /// A request name, its typed payload, and the value returned by its handler.
@@ -115,18 +116,37 @@ impl<R> Asked<R> {
     }
 
     /// Provides command launches owned by this exact request.
-    #[must_use]
-    pub fn commands(&self) -> RequestCommands {
-        RequestCommands {
-            reply: Arc::clone(&self.delivery),
-        }
+    pub fn commands(&self) -> Result<RequestCommands> {
+        let mut out = ptr::null_mut();
+        // SAFETY: the reply stays live and out is writable during the call.
+        check(unsafe { sys::siphon_reply_commands(self.delivery.0, &mut out) })?;
+        Ok(RequestCommands {
+            handle: Arc::new(RequestCommandsHandle(handle(out)?)),
+        })
     }
 }
 
 /// Starts commands owned by one request delivery.
+///
+/// The handle can outlive the handler. Launches require a pending, uninterrupted request.
 #[derive(Debug, Clone)]
 pub struct RequestCommands {
-    reply: Arc<Reply>,
+    handle: Arc<RequestCommandsHandle>,
+}
+
+#[derive(Debug)]
+struct RequestCommandsHandle(NonNull<sys::RequestCommands>);
+
+// SAFETY: the native handle can be used and freed from any thread.
+unsafe impl Send for RequestCommandsHandle {}
+// SAFETY: native synchronizes concurrent launches, and Arc keeps the handle live during calls.
+unsafe impl Sync for RequestCommandsHandle {}
+
+impl Drop for RequestCommandsHandle {
+    fn drop(&mut self) {
+        // SAFETY: only the last Arc owner frees this handle.
+        unsafe { sys::siphon_request_commands_free(self.0.as_ptr()) };
+    }
 }
 
 impl RequestCommands {
@@ -135,7 +155,13 @@ impl RequestCommands {
         spawn_with(spec, |spec, command, events| {
             // SAFETY: both handles and the spec remain live. Outputs are writable and distinct.
             unsafe {
-                sys::siphon_reply_spawn(self.reply.0, namespace.0.as_ptr(), spec, command, events)
+                sys::siphon_request_commands_spawn(
+                    self.handle.0.as_ptr(),
+                    namespace.0.as_ptr(),
+                    spec,
+                    command,
+                    events,
+                )
             }
         })
     }
