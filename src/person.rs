@@ -72,14 +72,14 @@ impl RuntimeHandle {
     }
 
     pub fn answer_blocking(&self, id: &RequestId, answer: &Value) -> Result<Revision> {
-        let mut revision = ptr::null_mut();
+        let mut out = sys::RevisionReceipt::default();
         let view = id.view();
         let answer = serde_json::to_vec(answer)?;
         // SAFETY: the inputs are readable for the call and the result slot is writable.
         check(unsafe {
-            sys::siphon_runtime_answer(self.0.as_ptr(), &view, slice(&answer), &mut revision)
+            sys::siphon_runtime_answer(self.0.as_ptr(), &view, slice(&answer), &mut out)
         })?;
-        Revision::from_owned(revision)
+        Revision::from_receipt(out)
     }
 }
 

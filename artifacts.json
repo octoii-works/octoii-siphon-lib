@@ -1,1 +1,28 @@
-{}
+{
+  "aarch64-apple-darwin": {
+    "abi": 6,
+    "target": "aarch64-apple-darwin",
+    "sha256": "5a60eaae01ceea2c7d84918ed523b4fce480b8e18995a3113d364adeda8c0a17"
+  },
+  "aarch64-unknown-linux-gnu": {
+    "abi": 6,
+    "target": "aarch64-unknown-linux-gnu",
+    "sha256": "9db7cc2a24a228b2a9f5faae249945a6afaea3431b1083aab15bce2a57e20649"
+  },
+  "x86_64-apple-darwin": {
+    "abi": 6,
+    "target": "x86_64-apple-darwin",
+    "sha256": "7a3639eea893a98b97415f9f5a1aa1d7dd8f832ea30c9c350843abfd7ff3d8b2"
+  },
+  "x86_64-pc-windows-msvc": {
+    "abi": 6,
+    "target": "x86_64-pc-windows-msvc",
+    "sha256": "8c012c6f156d88a9e78970af1174760cfb0a8aa1289891a15a58e1690c42f2af",
+    "dll_sha256": "787cfa878164548df0649f5a2c6ecf7ae1971a241e3027684e2e9ea66c2b249c"
+  },
+  "x86_64-unknown-linux-gnu": {
+    "abi": 6,
+    "target": "x86_64-unknown-linux-gnu",
+    "sha256": "eb48c2deaad619137c8189f576867ed4f0217f8127d93dcc9eadfe1be9daeaad"
+  }
+}

@@ -337,10 +337,10 @@ impl RuntimeHandle {
 
     /// Commits a batch on a synchronous caller thread.
     pub fn commit_blocking(&self, changes: &Changes) -> Result<Revision> {
-        let mut out = std::ptr::null_mut();
-        // SAFETY: handles remain live and changes are immutably borrowed during the call.
+        let mut out = sys::RevisionReceipt::default();
+        // SAFETY: handles remain live, changes are immutably borrowed, and out is writable.
         check(unsafe { sys::siphon_runtime_commit(self.0.as_ptr(), changes.as_ptr(), &mut out) })?;
-        Revision::from_owned(out)
+        Revision::from_receipt(out)
     }
 
     /// Confirms this revision on persistent storage and returns its durable sequence.
@@ -348,7 +348,7 @@ impl RuntimeHandle {
         let mut through = 0;
         // SAFETY: the runtime and receipt remain live, and through is writable.
         check(unsafe {
-            sys::siphon_runtime_flush(self.0.as_ptr(), revision.0.as_ptr(), &mut through)
+            sys::siphon_runtime_flush(self.0.as_ptr(), revision.raw.as_ptr(), &mut through)
         })?;
         Ok(through)
     }
@@ -398,7 +398,10 @@ impl RuntimeHandle {
 
 /// A visible commit receipt from one open volume.
 #[derive(Debug)]
-pub struct Revision(NonNull<sys::Revision>);
+pub struct Revision {
+    raw: NonNull<sys::Revision>,
+    seq: u64,
+}
 
 // SAFETY: a receipt is immutable and owned by this wrapper.
 unsafe impl Send for Revision {}
@@ -406,23 +409,23 @@ unsafe impl Send for Revision {}
 unsafe impl Sync for Revision {}
 
 impl Revision {
-    pub(crate) fn from_owned(out: *mut sys::Revision) -> Result<Self> {
-        Ok(Self(handle(out)?))
+    pub(crate) fn from_receipt(receipt: sys::RevisionReceipt) -> Result<Self> {
+        Ok(Self {
+            raw: handle(receipt.revision)?,
+            seq: receipt.seq,
+        })
     }
 
     /// The receipt's visible commit sequence.
-    pub fn seq(&self) -> Result<u64> {
-        let mut seq = 0;
-        // SAFETY: this receipt remains live and the output is writable.
-        check(unsafe { sys::siphon_revision_seq(self.0.as_ptr(), &mut seq) })?;
-        Ok(seq)
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 }
 
 impl Drop for Revision {
     fn drop(&mut self) {
         // SAFETY: this is the sole release of the owned receipt.
-        unsafe { sys::siphon_revision_free(self.0.as_ptr()) };
+        unsafe { sys::siphon_revision_free(self.raw.as_ptr()) };
     }
 }
 

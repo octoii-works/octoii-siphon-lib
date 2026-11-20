@@ -5,7 +5,7 @@ use std::{
     panic::panic_any,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
     thread,
@@ -14,8 +14,8 @@ use std::{
 
 use octoii_siphon_lib::{
     Answer, Asked, AskedOfPerson, Builder, Changes, Ending, Error, Fiber, FiberId, Following, Mail,
-    Options, Outcome, PersonRequest, Published, Request, RequestId, Run, Runtime, Signal, Status,
-    StreamEvent, Unanswered, Wait, fiber_path,
+    Options, Outcome, PersonRequest, Published, Request, RequestId, Retries, Run, Runtime, Signal,
+    Status, StreamEvent, Unanswered, Wait, fiber_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +77,10 @@ impl AskedOfPerson for Lookup {
     }
 }
 
-struct Twice;
+#[derive(Default)]
+struct Twice {
+    threw_after_first_answer: AtomicBool,
+}
 
 #[derive(Deserialize, Serialize)]
 enum Turn {
@@ -91,6 +94,14 @@ enum Turn {
 
 impl Fiber for Twice {
     const KIND: &'static str = "contract.requests";
+    const OPTIONS: Options = Options {
+        retries: Retries {
+            count: 1,
+            delay_min_ms: 1,
+            delay_max_ms: 1,
+        },
+        ..Options::DEFAULT
+    };
     type Input = u32;
     type Checkpoint = Turn;
     type Output = (u32, u32);
@@ -105,21 +116,23 @@ impl Fiber for Twice {
             None => {
                 let key = run.new_id()?;
                 run.request(&key, &Lookup(input))?;
-                assert_eq!(run.answer::<Lookup>(&key)?, None);
+                assert_eq!(run.take_answer::<Lookup>(&key)?, None);
                 Ok(Ending::Wait(
                     Turn::First(key.clone()),
                     Wait::new().mail(key),
                 ))
             }
             Some(Turn::First(first_key)) => {
-                let Some(Answer::Given(first)) = run.answer::<Lookup>(&first_key)? else {
+                let mail = run.mail(first_key.as_bytes())?.expect("first answer mail");
+                let Some(Answer::Given(first)) = run.take_answer::<Lookup>(&first_key)? else {
                     panic!("first answer missing");
                 };
-                assert!(run.take_mail(first_key.as_bytes())?.is_some());
-                assert_eq!(
-                    run.answer::<Lookup>(&first_key)?,
-                    Some(Answer::Given(first))
-                );
+                assert_eq!(run.take_answer::<Lookup>(&first_key)?, None);
+                assert_eq!(run.take_mail(first_key.as_bytes())?, None);
+                assert_eq!(run.mail(first_key.as_bytes())?, Some(mail));
+                if !self.threw_after_first_answer.swap(true, Ordering::Relaxed) {
+                    anyhow::bail!("retry after staging the first answer");
+                }
                 let second_key = run.new_id()?;
                 run.request(&second_key, &Lookup(first))?;
                 assert_ne!(first_key, second_key);
@@ -137,11 +150,10 @@ impl Fiber for Twice {
                 second_key,
                 first,
             }) => {
-                assert_eq!(run.answer::<Lookup>(&first_key)?, None);
-                let Some(Answer::Given(second)) = run.answer::<Lookup>(&second_key)? else {
+                assert_eq!(run.take_answer::<Lookup>(&first_key)?, None);
+                let Some(Answer::Given(second)) = run.take_answer::<Lookup>(&second_key)? else {
                     panic!("second answer missing");
                 };
-                run.take_mail(second_key.as_bytes())?;
                 run.changes
                     .write(b"answers", format!("{first}, {second}").as_bytes())?;
                 Ok(Ending::Done((first, second)))
@@ -179,7 +191,7 @@ fn phases_commit_ordered_requests_and_discard_thrown_requests() {
     builder
         .fiber(Throws)
         .unwrap()
-        .fiber(Twice)
+        .fiber(Twice::default())
         .unwrap()
         .handle::<Lookup, _, _>(executor.handle(), move |asked| {
             assert_eq!(thread::current().name(), Some("siphon-request-host"));
@@ -256,11 +268,10 @@ impl Fiber for Once {
             run.request(&key, &Lookup(input))?;
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
-        let Some(answer) = run.answer::<Lookup>(&key)?.map(Response::from) else {
+        let Some(answer) = run.take_answer::<Lookup>(&key)?.map(Response::from) else {
             // A stop handler can run before the async host has given its partial result.
             return Ok(Ending::Wait(key.clone(), Wait::new().mail(key)));
         };
-        run.take_mail(key.as_bytes())?;
         if run.is_stop_handler() {
             Ok(Ending::Stopped(Some(answer)))
         } else {
@@ -400,7 +411,7 @@ fn a_person_request_survives_reopening_and_accepts_only_a_fitting_current_answer
     );
 
     let answered = runtime.answer_blocking(&id, &valid).unwrap();
-    assert!(answered.seq().unwrap() > standing.sequence().unwrap());
+    assert!(answered.seq() > standing.sequence().unwrap());
     assert_eq!(
         runtime
             .answer_blocking(&original.id, &valid)
@@ -753,11 +764,8 @@ mod machine_requests {
                 if page.is_some() {
                     continue;
                 }
-                match run.answer::<RenderPage>(key)? {
-                    Some(Answer::Given(markup)) => {
-                        run.take_mail(key.as_bytes())?;
-                        *page = Some(markup);
-                    }
+                match run.take_answer::<RenderPage>(key)? {
+                    Some(Answer::Given(markup)) => *page = Some(markup),
                     Some(answer) => anyhow::bail!("{key} did not render: {answer:?}"),
                     None => wait = wait.mail(key.as_bytes()),
                 }

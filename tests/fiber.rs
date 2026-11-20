@@ -15,6 +15,7 @@ use octoii_siphon_lib::{
     Builder, Changes, Ending, Error, Fiber, Mail, Options, Outcome, Query, Range, Run, Runtime,
     Signal, Snapshot, Status, Wait, fiber_path,
 };
+use serde::{Deserialize, Serialize};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -203,7 +204,7 @@ fn checkpoints_waits_and_phase_writes_survive_reopen() {
     builder.fiber(Parent).unwrap().fiber(Child).unwrap();
     let mut wake = Changes::new().unwrap();
     wake.write(b"gate/signal", b"go").unwrap();
-    let wake_seq = runtime.commit_blocking(&wake).unwrap().seq().unwrap();
+    let wake_seq = runtime.commit_blocking(&wake).unwrap().seq();
     let before_start = runtime.snapshot().unwrap();
     assert_eq!(before_start.sequence().unwrap(), wake_seq);
     assert_eq!(before_start.read(b"log").unwrap(), log_before_wake);
@@ -642,6 +643,7 @@ fn graceful_removal_runs_stop_handlers_and_force_removal_kills_the_subtree() {
     );
 }
 
+#[derive(Deserialize, Serialize)]
 struct PanicOnDrop;
 
 impl Drop for PanicOnDrop {
@@ -655,15 +657,15 @@ struct Fails;
 impl Fiber for Fails {
     const KIND: &'static str = "contract.failure";
     type Input = String;
-    type Checkpoint = ();
+    type Checkpoint = PanicOnDrop;
     type Output = ();
 
     fn run(
         &self,
         run: &mut Run<'_>,
         input: String,
-        _: Option<()>,
-    ) -> anyhow::Result<Ending<(), ()>> {
+        _: Option<Self::Checkpoint>,
+    ) -> anyhow::Result<Ending<Self::Checkpoint, ()>> {
         run.changes.write(input.as_bytes(), b"staged")?;
         match input.as_str() {
             "fail" => Ok(Ending::Fail("explicit failure".into())),
@@ -673,6 +675,7 @@ impl Fiber for Fails {
             }
             .into()),
             "panic" => panic_any(PanicOnDrop),
+            "drop-checkpoint" => Ok(Ending::Wait(PanicOnDrop, Wait::new().mail(b"wake"))),
             _ => unreachable!(),
         }
     }
@@ -692,6 +695,7 @@ fn explicit_failure_commits_writes_while_errors_and_panics_discard_them() {
         ),
         ("error", "callback error", None),
         ("panic", "the phase panicked", None),
+        ("drop-checkpoint", "panic while dropping the payload", None),
     ] {
         let path = start::<Fails>(&runtime, kind.as_bytes(), &kind.into());
         let snapshot = finished(&runtime, &path);

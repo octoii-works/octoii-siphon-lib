@@ -39,6 +39,12 @@ pub struct Revision {
     _private: [u8; 0],
 }
 #[repr(C)]
+#[derive(Default)]
+pub struct RevisionReceipt {
+    pub revision: *mut Revision,
+    pub seq: u64,
+}
+#[repr(C)]
 pub struct Changes {
     _private: [u8; 0],
 }
@@ -73,6 +79,42 @@ impl Default for Slice {
 pub struct FiberId {
     pub path: Slice,
     pub generation: [u8; 16],
+}
+#[repr(C)]
+pub struct PhaseView {
+    pub id: FiberId,
+    pub time_ms: i64,
+    pub stop_handler: u8,
+    pub snapshot: *const Snapshot,
+    pub changes: *mut Changes,
+    pub input: Slice,
+    pub checkpoint: Slice,
+}
+#[repr(C)]
+pub struct SliceList {
+    pub data: *const Slice,
+    pub len: usize,
+}
+impl From<&[Slice]> for SliceList {
+    fn from(values: &[Slice]) -> Self {
+        Self {
+            data: values.as_ptr(),
+            len: values.len(),
+        }
+    }
+}
+#[repr(C)]
+pub struct WaitView {
+    pub children: SliceList,
+    pub changes: SliceList,
+    pub mail: SliceList,
+    pub deadline: *const i64,
+}
+#[repr(C)]
+pub struct EndingView {
+    pub kind: u32,
+    pub payload: Slice,
+    pub wait: *const WaitView,
 }
 #[repr(C)]
 pub struct MailView {
@@ -283,9 +325,6 @@ impl Default for Watch {
     }
 }
 
-pub const WAIT_CHILD: u32 = 1;
-pub const WAIT_CHANGE: u32 = 2;
-pub const WAIT_MAIL: u32 = 3;
 pub const END_NEXT: u32 = 1;
 pub const END_WAIT: u32 = 2;
 pub const END_DONE: u32 = 3;
@@ -308,7 +347,7 @@ pub const ANSWER_INTERRUPTED: u32 = 3;
 pub const REQUEST_STOP: u32 = 1;
 pub const REQUEST_CLOSED: u32 = 2;
 
-type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, Slice, Slice);
+type PhaseCallback = unsafe extern "C" fn(*mut c_void, *mut Run, *const PhaseView);
 type ReleaseCallback = unsafe extern "C" fn(*mut c_void);
 type CommitCallback = unsafe extern "C" fn(*mut c_void, *const CommitEvent);
 type NotifyCallback = unsafe extern "C" fn(*mut c_void, u32);
@@ -360,9 +399,8 @@ unsafe extern "C" {
     pub fn siphon_runtime_commit(
         runtime: *const Runtime,
         changes: *const Changes,
-        out: *mut *mut Revision,
+        out: *mut RevisionReceipt,
     ) -> Status;
-    pub fn siphon_revision_seq(revision: *const Revision, out: *mut u64) -> Status;
     pub fn siphon_revision_free(revision: *mut Revision);
     pub fn siphon_runtime_flush(
         runtime: *const Runtime,
@@ -393,7 +431,7 @@ unsafe extern "C" {
         runtime: *const Runtime,
         id: *const RequestId,
         answer: Slice,
-        out: *mut *mut Revision,
+        out: *mut RevisionReceipt,
     ) -> Status;
     pub fn siphon_runtime_new_id(runtime: *const Runtime, out: *mut Buffer) -> Status;
     pub fn siphon_runtime_now_ms(runtime: *const Runtime, out: *mut i64) -> Status;
@@ -590,19 +628,11 @@ unsafe extern "C" {
         visit: Option<FiberIdVisitor>,
     ) -> Status;
     pub fn siphon_snapshot_free(snapshot: *mut Snapshot);
-    pub fn siphon_run_info(
-        run: *const Run,
-        id: *mut FiberId,
-        time_ms: *mut i64,
-        stop_handler: *mut u8,
-    ) -> Status;
     pub fn siphon_run_new_id(run: *const Run, out: *mut Buffer) -> Status;
-    pub fn siphon_run_changes(run: *mut Run) -> *mut Changes;
-    pub fn siphon_run_snapshot(run: *const Run) -> *const Snapshot;
     pub fn siphon_run_request(run: *mut Run, key: Slice, name: Slice, payload: Slice) -> Status;
     pub fn siphon_run_cancel_request(run: *mut Run, key: Slice) -> Status;
-    pub fn siphon_run_answer(
-        run: *const Run,
+    pub fn siphon_run_take_answer(
+        run: *mut Run,
         key: Slice,
         kind: *mut u32,
         payload: *mut Buffer,
@@ -619,9 +649,7 @@ unsafe extern "C" {
         context: *mut c_void,
         visit: Option<MailVisitor>,
     ) -> Status;
-    pub fn siphon_run_wait_for(run: *mut Run, kind: u32, value: Slice) -> Status;
-    pub fn siphon_run_wait_until(run: *mut Run, deadline: i64) -> Status;
-    pub fn siphon_run_end(run: *mut Run, kind: u32, payload: Slice) -> Status;
+    pub fn siphon_run_end(run: *mut Run, ending: *const EndingView) -> Status;
     pub fn siphon_reply_submit(reply: *const Reply, kind: u32, payload: Slice) -> Status;
     pub fn siphon_reply_publish(reply: *const Reply, topic: Slice, data: Slice) -> Status;
     pub fn siphon_reply_commands(reply: *const Reply, out: *mut *mut RequestCommands) -> Status;

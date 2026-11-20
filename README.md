@@ -3,15 +3,20 @@
 Rust bindings for Siphon's native execution library. Siphon owns the behavior of the
 operations below. This crate maps Rust types, errors, callbacks and ownership to the native ABI.
 
-The 0.0.4 candidate targets development ABI 6. Set `SIPHON_LIB_DIR` to the directory containing
-the matching binary and its `manifest.json`. The build checks the target, ABI and SHA-256 against
-`artifacts.json`. A paired development build supplies its verified manifest during testing.
-Release pins are populated from the platform release builds.
+Version 0.0.4 uses ABI 6. Download the ZIP for your Rust target from the
+[0.0.4 release](https://github.com/octoii-works/octoii-siphon-lib/releases/tag/v0.0.4),
+extract it, and set `SIPHON_LIB_DIR` to the absolute path of the directory containing
+`manifest.json`. The build checks the target, ABI and SHA-256 against `artifacts.json`.
 
-The distribution targets macOS ARM64 and x64, Linux x64 GNU, and Windows x64 MSVC. macOS and Linux
-link a static archive. On Windows, place the shipped `siphon_ffi.dll` beside the application or on its
-DLL search path. Restricted commands, pseudo-terminals and the descriptor channel currently require
-macOS or Linux.
+| Target | Native library |
+| --- | --- |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | macOS static archive |
+| `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu` | Linux GNU static archive |
+| `x86_64-pc-windows-msvc` | Windows DLL and import library |
+
+On Windows, deploy `siphon_ffi.dll` beside the application or on its DLL search path and install
+the [x64 Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/).
+Restricted commands, pseudo-terminals and the descriptor channel require macOS or Linux.
 
 ## Volume and runtime
 
@@ -30,11 +35,15 @@ assert_eq!(snapshot.read(b"message")?.as_deref(), Some(b"hello".as_slice()));
 ```
 
 `RuntimeHandle::commit` runs the synchronous binding on a Tokio blocking task.
-`Runtime::close` waits for shutdown. A retained handle can call operations while the owner has the
-runtime open. Snapshots and mounted volume views can retain storage until they are released.
+`Runtime::close` stops admitting new work, waits for the native worker and its commit callbacks,
+and reports the first terminal fault, if any. Snapshots and mounted volume views can retain storage
+until they are released.
 
-Use `RuntimeHandle::commits` to observe the latest visible head and the terminal event. Read the
-snapshot journal from your cursor for change details. Notifications can coalesce.
+Use `RuntimeHandle::commits` for passive observation of the latest visible head. Notifications can
+coalesce. Read the snapshot journal from your cursor for change details. Active subscriptions and
+subscriptions created on retained handles after close receive the same terminal event with the final
+visible sequence, either `CommitEvent::Closed(seq)` or `CommitEvent::Fault { head, error }`. The next
+read returns `None`. Registration during shutdown can wait for the terminal event.
 
 ## Durable execution
 
@@ -49,7 +58,9 @@ lets a handler start commands through the delivery's request capability. Command
 `WouldBlock` when its queue is full. Pipe and terminal output can report a skipped byte range that
 callers can reconcile against the retained output.
 
-`Run::mail` reads a delivery. `Run::take_mail` stages its consumption once and returns the staged
-delivery. Carry a `RequestId` as an opaque string using `to_token` and `from_token`.
+`Run::mail` reads a delivery from the phase snapshot. `Run::take_mail` takes the observed mail, and
+`Run::take_answer` takes and decodes a request answer. Each delivery can be taken once per phase
+and is consumed when the phase commits. Carry a `RequestId` as an opaque string using `to_token`
+and `from_token`.
 
 The [C header](include/siphon.h) specifies native ownership, borrowed views, and asynchronous callbacks.

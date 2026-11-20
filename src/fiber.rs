@@ -2,7 +2,7 @@ use std::{
     ffi::c_void,
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 use bytes::Bytes;
@@ -208,21 +208,18 @@ pub struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
-    /// Safety: `run` is a live, exclusive native callback handle for this borrow.
-    unsafe fn new(phase: &'a mut NonNull<sys::Run>) -> Result<Self> {
-        let run = phase.as_ptr();
-        let mut id = sys::FiberId::default();
-        let mut time_ms = 0;
-        let mut stop_handler = 0;
-        check(unsafe { sys::siphon_run_info(run, &mut id, &mut time_ms, &mut stop_handler) })?;
+    /// Safety: the exclusive phase and the values in its view remain live for this borrow.
+    unsafe fn new(phase: &'a mut NonNull<sys::Run>, view: &'a sys::PhaseView) -> Result<Self> {
         Ok(Self {
             phase,
-            id: unsafe { FiberId::from_view(&id) },
-            time_ms,
-            stop_handler: stop_handler != 0,
-            changes: Batch::new(handle(unsafe { sys::siphon_run_changes(run) })?),
+            // SAFETY: the view lends the ID bytes for the callback.
+            id: unsafe { FiberId::from_view(&view.id) },
+            time_ms: view.time_ms,
+            stop_handler: view.stop_handler != 0,
+            changes: Batch::new(handle(view.changes)?),
+            // SAFETY: the view lends its live, immutable snapshot for this borrow.
             snapshot: unsafe {
-                handle(sys::siphon_run_snapshot(run).cast_mut())?
+                handle(view.snapshot.cast_mut())?
                     .cast::<Snapshot>()
                     .as_ref()
             },
@@ -275,13 +272,14 @@ impl<'a> Run<'a> {
         check(unsafe { sys::siphon_run_cancel_request(self.phase.as_ptr(), slice(key.as_ref())) })
     }
 
-    /// Reads the request's answer from this phase's snapshot. Returns `None` when it is absent.
-    pub fn answer<R: Request>(&self, key: &str) -> Result<Option<Answer<R::Answer>>> {
+    /// Takes the observed request answer once per phase and consumes it when the phase commits.
+    /// An absent or already taken delivery returns `None`.
+    pub fn take_answer<R: Request>(&mut self, key: &str) -> Result<Option<Answer<R::Answer>>> {
         let mut kind = 0;
         let mut payload = sys::Buffer::default();
-        // SAFETY: the phase and key are live for this call and both outputs are writable.
+        // SAFETY: the phase is live and exclusive, the key is readable, and both outputs are writable.
         let status = unsafe {
-            sys::siphon_run_answer(
+            sys::siphon_run_take_answer(
                 self.phase.as_ptr(),
                 slice(key.as_bytes()),
                 &mut kind,
@@ -374,20 +372,21 @@ unsafe extern "C" fn collect_mail(context: *mut c_void, view: *const sys::MailVi
 unsafe extern "C" fn run_fiber<P: Fiber>(
     context: *mut c_void,
     run: *mut sys::Run,
-    input: sys::Slice,
-    checkpoint: sys::Slice,
+    view: *const sys::PhaseView,
 ) {
     let executed = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<()> {
         // SAFETY: registration keeps context and callback data alive until this call returns.
-        let fiber = unsafe { &*context.cast::<P>() };
-        let (input, checkpoint) = unsafe { (borrow_slice(input), borrow_slice(checkpoint)) };
+        let (fiber, view) = unsafe { (&*context.cast::<P>(), &*view) };
+        // SAFETY: the view lends both slices until this callback returns.
+        let (input, checkpoint) =
+            unsafe { (borrow_slice(view.input), borrow_slice(view.checkpoint)) };
         let input = from_slice(input)?;
         let checkpoint = (!checkpoint.is_empty())
             .then(|| from_slice(checkpoint))
             .transpose()?;
         let mut phase = handle(run)?;
-        // SAFETY: this is the unique live callback handle for this invocation.
-        let mut scoped = unsafe { Run::new(&mut phase)? };
+        // SAFETY: the library lends the exclusive callback handle and its view in this invocation.
+        let mut scoped = unsafe { Run::new(&mut phase, view)? };
         let ending = fiber.run(&mut scoped, input, checkpoint)?;
         finish(run, ending)?;
         Ok(())
@@ -395,7 +394,7 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
     match executed {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let _ = end(run, sys::END_THROW, format!("{error:#}").as_bytes());
+            let _ = end(run, sys::END_THROW, format!("{error:#}").as_bytes(), None);
         }
         Err(panic) => {
             let message = panic_message(panic.as_ref());
@@ -403,6 +402,7 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
                 run,
                 sys::END_THROW,
                 format!("the phase panicked: {message}").as_bytes(),
+                None,
             );
             discard_panic(panic);
         }
@@ -410,27 +410,13 @@ unsafe extern "C" fn run_fiber<P: Fiber>(
 }
 
 fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) -> Result<()> {
+    // Serialize and drop fiber-owned values before publishing the ending, as either can panic.
     let (kind, payload) = match ending {
         Ending::Next(checkpoint) => (sys::END_NEXT, to_vec(&checkpoint)?),
         Ending::Wait(checkpoint, wait) => {
-            let checkpoint = to_vec(&checkpoint)?;
-            for child in &wait.children {
-                // SAFETY: run and the borrowed bytes are live for this call.
-                check(unsafe { sys::siphon_run_wait_for(run, sys::WAIT_CHILD, slice(child)) })?;
-            }
-            for path in &wait.changes {
-                // SAFETY: as above, run and path are live for this call.
-                check(unsafe { sys::siphon_run_wait_for(run, sys::WAIT_CHANGE, slice(path)) })?;
-            }
-            for key in &wait.mail {
-                // SAFETY: as above, run and key are live for this call.
-                check(unsafe { sys::siphon_run_wait_for(run, sys::WAIT_MAIL, slice(key)) })?;
-            }
-            if let Some(deadline) = wait.deadline {
-                // SAFETY: run is live throughout the callback.
-                check(unsafe { sys::siphon_run_wait_until(run, deadline) })?;
-            }
-            (sys::END_WAIT, checkpoint)
+            let payload = to_vec(&checkpoint)?;
+            drop(checkpoint);
+            return end_wait(run, &payload, &wait);
         }
         Ending::Done(output) => (sys::END_DONE, to_vec(&output)?),
         Ending::Fail(message) => (sys::END_FAIL, message.into_bytes()),
@@ -439,11 +425,30 @@ fn finish<C: Serialize, O: Serialize>(run: *mut sys::Run, ending: Ending<C, O>) 
             output.as_ref().map(to_vec).transpose()?.unwrap_or_default(),
         ),
     };
-    // Serialize and drop fiber-owned values before publishing the ending, as either can panic.
-    end(run, kind, &payload)
+    end(run, kind, &payload, None)
 }
 
-fn end(run: *mut sys::Run, kind: u32, payload: &[u8]) -> Result<()> {
-    // SAFETY: run is live throughout the callback, and the payload is readable for this call.
-    check(unsafe { sys::siphon_run_end(run, kind, slice(payload)) })
+fn end_wait(run: *mut sys::Run, payload: &[u8], wait: &Wait) -> Result<()> {
+    let slices = |values: &[Vec<u8>]| values.iter().map(|value| slice(value)).collect::<Vec<_>>();
+    let children = slices(&wait.children);
+    let changes = slices(&wait.changes);
+    let mail = slices(&wait.mail);
+    let view = sys::WaitView {
+        children: children.as_slice().into(),
+        changes: changes.as_slice().into(),
+        mail: mail.as_slice().into(),
+        deadline: wait.deadline.as_ref().map_or(ptr::null(), ptr::from_ref),
+    };
+    end(run, sys::END_WAIT, payload, Some(&view))
+}
+
+fn end(run: *mut sys::Run, kind: u32, payload: &[u8], wait: Option<&sys::WaitView>) -> Result<()> {
+    let ending = sys::EndingView {
+        kind,
+        payload: slice(payload),
+        wait: wait.map_or(ptr::null(), ptr::from_ref),
+    };
+    // SAFETY: run is live within the callback. The ending and all borrowed values are live for
+    // this call, and the library copies the values it retains.
+    check(unsafe { sys::siphon_run_end(run, &ending) })
 }

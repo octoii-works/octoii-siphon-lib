@@ -16,7 +16,7 @@ fn snapshots_are_consistent_and_data_survives_reopening() {
         .unwrap()
         .write(b"empty", b"")
         .unwrap();
-    let seq = runtime.commit_blocking(&first).unwrap().seq().unwrap();
+    let seq = runtime.commit_blocking(&first).unwrap().seq();
     let before = runtime.snapshot().unwrap();
     assert!(before.sequence().unwrap() >= seq);
     assert_eq!(before.read(b"empty").unwrap(), Some(Bytes::new()));
@@ -51,7 +51,7 @@ fn offline_collector_retries_stale_readings_and_flushes_the_result() {
 
     let mut seed = Changes::new().unwrap();
     seed.write(b"total", b"0").unwrap();
-    let seeded = runtime.commit_blocking(&seed).unwrap().seq().unwrap();
+    let seeded = runtime.commit_blocking(&seed).unwrap().seq();
     let north_view = runtime.snapshot().unwrap();
     let south_view = runtime.snapshot().unwrap();
     assert_eq!(north_view.sequence().unwrap(), seeded);
@@ -75,7 +75,7 @@ fn offline_collector_retries_stale_readings_and_flushes_the_result() {
     drop(south_view);
 
     let north_receipt = runtime.commit_blocking(&north).unwrap();
-    let first = north_receipt.seq().unwrap();
+    let first = north_receipt.seq();
     assert_eq!(
         runtime.commit_blocking(&stale).unwrap_err().status(),
         Status::Conflict
@@ -90,7 +90,7 @@ fn offline_collector_retries_stale_readings_and_flushes_the_result() {
 
     let south = collect(&after_north, b"south", 3);
     let south_receipt = runtime.commit_blocking(&south).unwrap();
-    let last = south_receipt.seq().unwrap();
+    let last = south_receipt.seq();
     let collected = runtime.snapshot().unwrap();
 
     let north_page = collected.journal(seeded, 1).unwrap();
@@ -138,7 +138,7 @@ fn offline_collector_retries_stale_readings_and_flushes_the_result() {
     assert_eq!(snapshot.read(b"total").unwrap().as_deref(), Some(&b"5"[..]));
     assert_eq!(snapshot.read(b"north").unwrap().as_deref(), Some(&b"2"[..]));
     assert_eq!(snapshot.read(b"south").unwrap().as_deref(), Some(&b"3"[..]));
-    assert_eq!(south_receipt.seq().unwrap(), last);
+    assert_eq!(south_receipt.seq(), last);
     assert_eq!(
         reopened.flush(&south_receipt).unwrap_err().status(),
         Status::Invalid
@@ -160,7 +160,7 @@ fn directory_pages_and_entries_are_owned_after_runtime_close() {
         .unwrap()
         .write(b"data/p\xff", b"raw")
         .unwrap();
-    let seq = runtime.commit_blocking(&changes).unwrap().seq().unwrap();
+    let seq = runtime.commit_blocking(&changes).unwrap().seq();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -398,13 +398,12 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
 
     let mut write = Changes::new().unwrap();
     write.write(b"raw\xff", b"one").unwrap();
-    let first = runtime.commit_blocking(&write).unwrap().seq().unwrap();
+    let first = runtime.commit_blocking(&write).unwrap().seq();
     let retained = runtime.snapshot().unwrap();
     let empty = runtime
         .commit_blocking(&Changes::new().unwrap())
         .unwrap()
-        .seq()
-        .unwrap();
+        .seq();
     assert!(empty > first);
 
     let mut rewrite = Changes::new().unwrap();
@@ -413,7 +412,7 @@ fn journal_pages_keep_commit_boundaries_and_advance_over_empty_commits() {
         .unwrap()
         .write(b"new", b"two")
         .unwrap();
-    let last = runtime.commit_blocking(&rewrite).unwrap().seq().unwrap();
+    let last = runtime.commit_blocking(&rewrite).unwrap().seq();
     let snapshot = runtime.snapshot().unwrap();
     runtime.close().unwrap();
 
@@ -549,7 +548,7 @@ async fn commit_subscription_reports_progress_and_closes_with_its_runtime() {
 
     let mut batch = Changes::new().unwrap();
     batch.write(b"file", b"one").unwrap();
-    let first = runtime.commit(batch).await.unwrap().seq().unwrap();
+    let first = runtime.commit(batch).await.unwrap().seq();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
@@ -569,7 +568,7 @@ async fn commit_subscription_reports_progress_and_closes_with_its_runtime() {
     drop(cancelled);
     let mut next = Changes::new().unwrap();
     next.write(b"file", b"two").unwrap();
-    let second = runtime.commit(next).await.unwrap().seq().unwrap();
+    let second = runtime.commit(next).await.unwrap().seq();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), watch.next())
             .await
@@ -581,22 +580,24 @@ async fn commit_subscription_reports_progress_and_closes_with_its_runtime() {
     assert_eq!(journal.through, second);
     assert_eq!(journal.change_sets[0].paths, [b"file".to_vec()]);
 
+    let retained = runtime.runtime_handle();
     runtime.close().unwrap();
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), watch.next())
+    let after_close = retained.commits().unwrap();
+    drop(runtime);
+    let after_owner_drop = retained.commits().unwrap();
+
+    for mut subscription in [watch, after_close, after_owner_drop] {
+        let terminal = tokio::time::timeout(Duration::from_secs(5), subscription.next())
             .await
             .unwrap()
-            .unwrap(),
-        Some(CommitEvent::Closed(seq)) if seq == second
-    ));
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .unwrap();
+        assert_eq!(terminal, Some(CommitEvent::Closed(second)));
+        let end = tokio::time::timeout(Duration::from_secs(5), subscription.next())
             .await
             .unwrap()
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(runtime.commits().unwrap_err().code, 3);
+            .unwrap();
+        assert_eq!(end, None);
+    }
 }
 
 #[test]
